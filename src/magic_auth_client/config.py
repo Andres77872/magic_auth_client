@@ -70,6 +70,8 @@ class MagicAuthConfig:
     validate_url: str | None = None
     api_key_validate_url: str | None = None
     profile_url: str | None = None
+    google_oauth_start_url: str | None = None
+    google_oauth_callback_url: str | None = None
     project_hash: str | None = None
     user_group_hash: str | None = None
     user_agent: str = constants.DEFAULT_USER_AGENT
@@ -127,6 +129,44 @@ class MagicAuthConfig:
     def profile_endpoint(self) -> str:
         return self._resolve(self.profile_url, constants.PATH_PROFILE)
 
+    @property
+    def google_oauth_start_endpoint(self) -> str:
+        return self._resolve(self.google_oauth_start_url, constants.PATH_GOOGLE_OAUTH_START)
+
+    @property
+    def google_oauth_callback_endpoint(self) -> str:
+        return self._resolve(self.google_oauth_callback_url, constants.PATH_GOOGLE_OAUTH_CALLBACK)
+
+    # Password & email endpoints (no env override; always resolved from base_url) --
+    @property
+    def password_forgot_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PASSWORD_FORGOT)
+
+    @property
+    def password_reset_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PASSWORD_RESET)
+
+    @property
+    def password_change_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PASSWORD_CHANGE)
+
+    @property
+    def email_verify_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_EMAIL_VERIFY)
+
+    @property
+    def user_emails_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_USER_EMAILS)
+
+    def user_email_endpoint(self, email_id: str) -> str:
+        return f"{self.user_emails_endpoint}/{email_id}"
+
+    def user_email_resend_endpoint(self, email_id: str) -> str:
+        return f"{self.user_emails_endpoint}/{email_id}/resend"
+
+    def user_email_primary_endpoint(self, email_id: str) -> str:
+        return f"{self.user_emails_endpoint}/{email_id}/primary"
+
     # Construction -------------------------------------------------------------
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "MagicAuthConfig":
@@ -162,6 +202,8 @@ class MagicAuthConfig:
             validate_url=e.get("AUTH_VALIDATE_URL"),
             api_key_validate_url=e.get("AUTH_API_KEY_VALIDATE_URL"),
             profile_url=e.get("AUTH_PROFILE_URL"),
+            google_oauth_start_url=e.get("AUTH_GOOGLE_START_URL"),
+            google_oauth_callback_url=e.get("AUTH_GOOGLE_CALLBACK_URL"),
             project_hash=e.get("PROJECT_HASH"),
             user_group_hash=e.get("USER_GROUP_HASH"),
             user_agent=user_agent,

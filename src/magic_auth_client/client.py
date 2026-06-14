@@ -18,15 +18,20 @@ from . import constants
 from .config import MagicAuthConfig
 from .exceptions import AuthTransportError, DelegationError, parse_error_response
 from .models import (
+    ChangePasswordResponse,
     CheckAvailabilityResponse,
     DelegatedSession,
+    EmailListResponse,
     LoginResponse,
     LogoutResponse,
     RegisterResponse,
+    RemoveEmailResponse,
+    SetPrimaryEmailResponse,
     SwitchProjectResponse,
     UserProfileResponse,
     ValidateApiKeyResponse,
     ValidateSessionResponse,
+    _BaseResponse,
 )
 
 _M = TypeVar("_M", bound=BaseModel)
@@ -37,6 +42,21 @@ def _ua_override(user_agent: str | None) -> dict[str, str] | None:
     default. Used by the auth-forwarding methods so a reverse-proxy consumer can relay
     the original caller's User-Agent to the provider."""
     return {constants.HEADER_USER_AGENT: user_agent} if user_agent else None
+
+
+def _link_overrides(
+    user_agent: str | None, public_base_url: str | None
+) -> dict[str, str] | None:
+    """Combine the optional ``User-Agent`` and ``X-Public-Base-Url`` overrides into a
+    single header dict (or ``None`` when neither is set). A reverse-proxy/BFF consumer
+    relays the end-user's browser origin via ``public_base_url`` so the provider builds
+    user-facing links from where the user actually is, not its own bind address."""
+    headers: dict[str, str] = {}
+    if user_agent:
+        headers[constants.HEADER_USER_AGENT] = user_agent
+    if public_base_url:
+        headers[constants.HEADER_PUBLIC_BASE_URL] = public_base_url
+    return headers or None
 
 
 class MagicAuthClient:
@@ -91,6 +111,7 @@ class MagicAuthClient:
         *,
         model: type[_M],
         data: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
     ) -> _M:
@@ -115,6 +136,7 @@ class MagicAuthClient:
                 method,
                 url,
                 data=form,
+                params=params,
                 headers=req_headers,
             )
         except httpx.HTTPError as exc:
@@ -322,6 +344,267 @@ class MagicAuthClient:
             "GET",
             self._config.profile_endpoint,
             model=UserProfileResponse,
+            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+        )
+
+    # Google OAuth (agnostic legs) ---------------------------------------------
+    async def start_google_oauth(
+        self,
+        provider_init_token: str,
+        *,
+        redirect_uri: str,
+        return_origin: str,
+        remember_me: bool = False,
+        user_agent: str | None = None,
+    ) -> str:
+        """Begin the Google OAuth flow and return Google's authorization URL.
+
+        POSTs the opaque ``provider_init_token`` (minted by the calling project's
+        BFF, which keeps the strict project/group scope server-side) to the
+        provider's ``/auth/google/start``. The provider redeems it server-to-server,
+        creates PKCE/nonce state, and replies with a 303 to Google. This method does
+        NOT follow that redirect — it returns the ``Location`` (Google authorization
+        URL) for the BFF to hand to the browser as a top-level navigation. The
+        provider is agnostic about the project: ``redirect_uri`` (where Google sends
+        the user back — typically the BFF callback) and ``return_origin`` (the SPA
+        origin) are supplied by the BFF and validated against the provider allowlists.
+
+        Raises :class:`AuthApiError` if the provider rejects the request (provider
+        disabled, invalid/replayed provider-init, redirect/origin not allowed).
+        """
+        req_headers = {
+            constants.HEADER_USER_AGENT: user_agent or self._config.user_agent,
+            constants.HEADER_ACCEPT: "application/json",
+        }
+        body = {
+            "provider_init_token": provider_init_token,
+            "redirect_uri": redirect_uri,
+            "return_origin": return_origin,
+            "remember_me": remember_me,
+        }
+        try:
+            response = await self._client.request(
+                "POST",
+                self._config.google_oauth_start_endpoint,
+                json=body,
+                headers=req_headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise AuthTransportError(cause=exc) from exc
+
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise AuthTransportError(
+                    "Google OAuth start returned a redirect without a Location header"
+                )
+            return location
+        if response.status_code >= 400:
+            raise parse_error_response(response)
+        raise AuthTransportError(
+            f"Google OAuth start expected a redirect, got HTTP {response.status_code}"
+        )
+
+    async def complete_google_oauth(
+        self,
+        code: str,
+        state: str,
+        *,
+        user_agent: str | None = None,
+    ) -> LoginResponse:
+        """Complete the Google OAuth callback and return the issued session.
+
+        GETs the provider's ``/auth/google/callback`` with the ``code`` and ``state``
+        Google returned. The provider consumes the one-time state, exchanges the code,
+        verifies the ID token, and resolves/provisions the user into the group the BFF
+        bound via provider-init, returning a :class:`LoginResponse` — the same shape as
+        password login, including the refresh token. Intended to be called
+        server-to-server by the BFF (no browser cookies are required; CSRF rests on the
+        single-use ``state`` + PKCE + nonce).
+
+        Raises :class:`AuthApiError` on any OAuth failure (invalid/replayed state,
+        code-exchange failure, ID-token rejected, provisioning denied).
+        """
+        return await self._request(
+            "GET",
+            self._config.google_oauth_callback_endpoint,
+            model=LoginResponse,
+            params={"code": code, "state": state},
+            headers=_ua_override(user_agent),
+        )
+
+    # Password workflows -------------------------------------------------------
+    async def forgot_password(
+        self,
+        email_or_username: str,
+        *,
+        user_agent: str | None = None,
+        public_base_url: str | None = None,
+    ) -> _BaseResponse:
+        """Request a password-reset email by email or username.
+
+        Unauthenticated. The provider responds with a generic accepted body
+        regardless of whether the identifier resolves to an account (it never
+        discloses account existence). ``user_agent`` overrides the configured
+        User-Agent for this call. ``public_base_url`` relays the end-user's
+        browser origin so the emailed reset link points there (the provider
+        validates it against its allowlist).
+        """
+        return await self._request(
+            "POST",
+            self._config.password_forgot_endpoint,
+            model=_BaseResponse,
+            data={"email_or_username": email_or_username},
+            headers=_link_overrides(user_agent, public_base_url),
+        )
+
+    async def reset_password(
+        self, token: str, new_password: str, *, user_agent: str | None = None
+    ) -> _BaseResponse:
+        """Consume a password-reset link token and set a new password.
+
+        Unauthenticated; ``token`` is the ``lookup_id.secret`` value from the
+        emailed link. The provider validates the password policy *before* the
+        token, so a weak password raises a real 4xx (``WEAK_PASSWORD``); an
+        invalid/expired token returns a generic accepted body. No session is
+        created (all of the user's sessions are revoked on success).
+        """
+        return await self._request(
+            "POST",
+            self._config.password_reset_endpoint,
+            model=_BaseResponse,
+            data={"token": token, "new_password": new_password},
+            headers=_ua_override(user_agent),
+        )
+
+    async def change_password(
+        self,
+        token: str,
+        current_password: str,
+        new_password: str,
+        *,
+        user_agent: str | None = None,
+    ) -> ChangePasswordResponse:
+        """Change the authenticated user's password (Bearer ``token``).
+
+        Requires the current password for re-authentication. Wrong current
+        password raises ``AuthUnauthorizedError`` (``INVALID_CREDENTIALS``); a
+        weak new password raises ``WEAK_PASSWORD``. The provider revokes the
+        user's *other* sessions but preserves this one, and issues no new token.
+        ``user_agent`` overrides the configured User-Agent for this call.
+        """
+        headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
+        if user_agent:
+            headers[constants.HEADER_USER_AGENT] = user_agent
+        return await self._request(
+            "POST",
+            self._config.password_change_endpoint,
+            model=ChangePasswordResponse,
+            data={"current_password": current_password, "new_password": new_password},
+            headers=headers,
+        )
+
+    # Email workflows ----------------------------------------------------------
+    async def verify_email(
+        self, token: str, *, user_agent: str | None = None
+    ) -> _BaseResponse:
+        """Consume an email-activation link token.
+
+        Unauthenticated; ``token`` is the ``lookup_id.secret`` value from the
+        emailed link. Returns a generic accepted body regardless of outcome. On
+        success the provider activates the address and revokes the user's
+        sessions. ``user_agent`` overrides the configured User-Agent.
+        """
+        return await self._request(
+            "POST",
+            self._config.email_verify_endpoint,
+            model=_BaseResponse,
+            data={"token": token},
+            headers=_ua_override(user_agent),
+        )
+
+    async def list_emails(self, token: str) -> EmailListResponse:
+        """List the authenticated user's email addresses (Bearer ``token``)."""
+        return await self._request(
+            "GET",
+            self._config.user_emails_endpoint,
+            model=EmailListResponse,
+            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+        )
+
+    async def add_email(
+        self,
+        token: str,
+        email: str,
+        *,
+        user_agent: str | None = None,
+        public_base_url: str | None = None,
+    ) -> _BaseResponse:
+        """Add an email and enqueue an activation link (Bearer ``token``).
+
+        Returns a generic accepted body on success; an invalid address raises a
+        4xx. ``user_agent`` overrides the configured User-Agent for this call.
+        ``public_base_url`` relays the end-user's browser origin so the emailed
+        activation link points there (the provider validates it against its
+        allowlist).
+        """
+        headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
+        headers.update(_link_overrides(user_agent, public_base_url) or {})
+        return await self._request(
+            "POST",
+            self._config.user_emails_endpoint,
+            model=_BaseResponse,
+            data={"email": email},
+            headers=headers,
+        )
+
+    async def resend_email_activation(
+        self,
+        token: str,
+        email_id: str,
+        *,
+        user_agent: str | None = None,
+        public_base_url: str | None = None,
+    ) -> _BaseResponse:
+        """Resend the activation link for a pending email (Bearer ``token``).
+
+        Cooldown- and rate-limited by the provider; returns a generic accepted
+        body. ``user_agent`` overrides the configured User-Agent for this call.
+        ``public_base_url`` relays the end-user's browser origin so the emailed
+        activation link points there (the provider validates it against its
+        allowlist).
+        """
+        headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
+        headers.update(_link_overrides(user_agent, public_base_url) or {})
+        return await self._request(
+            "POST",
+            self._config.user_email_resend_endpoint(email_id),
+            model=_BaseResponse,
+            headers=headers,
+        )
+
+    async def remove_email(self, token: str, email_id: str) -> RemoveEmailResponse:
+        """Remove one of the user's email addresses (Bearer ``token``).
+
+        If the removed address was primary, the provider promotes the next
+        activated address and returns its id in ``new_primary_email_id``.
+        """
+        return await self._request(
+            "DELETE",
+            self._config.user_email_endpoint(email_id),
+            model=RemoveEmailResponse,
+            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+        )
+
+    async def set_primary_email(
+        self, token: str, email_id: str
+    ) -> SetPrimaryEmailResponse:
+        """Mark an activated email as the user's primary address (Bearer ``token``)."""
+        return await self._request(
+            "POST",
+            self._config.user_email_primary_endpoint(email_id),
+            model=SetPrimaryEmailResponse,
             headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
         )
 

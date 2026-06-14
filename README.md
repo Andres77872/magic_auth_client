@@ -103,7 +103,22 @@ All methods are `async` and return a typed pydantic model.
 | `switch_project(access_token, project_hash, *, refresh_token=None)` | `POST /auth/switch-project` | Bearer header + form body |
 | `check_availability(*, username=None, email=None)` | `POST /auth/check-availability` | |
 | `get_profile(token)` | `GET /users/profile` | |
+| `forgot_password(email_or_username)` | `POST /auth/password/forgot` | no auth; provider returns a generic 202 (no enumeration) |
+| `reset_password(token, new_password)` | `POST /auth/password/reset` | no auth; weak password raises `WEAK_PASSWORD`; revokes all sessions, mints none |
+| `change_password(token, current_password, new_password)` | `POST /auth/password/change` | Bearer; wrong current → `INVALID_CREDENTIALS`; preserves current session |
+| `verify_email(token)` | `POST /auth/email/verify` | no auth; generic 202; revokes sessions on success |
+| `list_emails(token)` | `GET /users/me/emails` | Bearer |
+| `add_email(token, email)` | `POST /users/me/emails` | Bearer; enqueues an activation link |
+| `resend_email_activation(token, email_id)` | `POST /users/me/emails/{id}/resend` | Bearer; cooldown-limited |
+| `remove_email(token, email_id)` | `DELETE /users/me/emails/{id}` | Bearer; promotes next primary |
+| `set_primary_email(token, email_id)` | `POST /users/me/emails/{id}/primary` | Bearer; address must be activated |
+| `start_google_oauth(provider_init_token, *, redirect_uri, return_origin, remember_me=False)` | `POST /auth/google/start` | returns Google's authorization URL (the 303 `Location`; not followed) |
+| `complete_google_oauth(code, state)` | `GET /auth/google/callback` | server-to-server; returns a `LoginResponse` |
 | `validate_delegated_session(*, delegation_api_key, session_token, …)` | `validate-api-key` + `validate` | see [Delegated auth](#delegated-auth) |
+
+**Email login** needs no new method: `login()` already forwards the `username` field verbatim, and the provider accepts an **activated email** there. A 429 rate-limit surfaces as a base `AuthApiError(status_code=429)` whose `.details` carries `retry_after_seconds` (the raw `Retry-After` header is not captured by the client).
+
+**Google sign-in** exposes only the two *agnostic* legs (`start_google_oauth` / `complete_google_oauth`). The project-specific concerns — minting the opaque `provider_init_token`, the browser entry/return, the one-time delivery code, and the session cookie — belong to the consuming BFF, not this client. `start_google_oauth` does **not** follow the `303`; it returns Google's authorization URL for the BFF to hand to the browser. `complete_google_oauth` is a server-to-server call (no browser cookies) and returns the same `LoginResponse` as password login, including the refresh token.
 
 ## Delegated auth
 

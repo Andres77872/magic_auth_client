@@ -149,6 +149,46 @@ class UserProfileResponse(_BaseResponse):
     projects: list[ProjectInfo] = Field(default_factory=list)
 
 
+class ChangePasswordResponse(_BaseResponse):
+    """Result of an authenticated password change (provider returns no new token)."""
+
+    message: str | None = "Password changed successfully"
+
+
+class EmailAddress(_AuthModel):
+    """One of a user's email addresses (owner view).
+
+    Mirrors the provider's owner email row. The provider never returns the raw
+    address in list payloads — only ``email_masked`` and the normalized ``email``
+    may be present — so consumers should display ``email_masked`` when available.
+    """
+
+    id: str | None = None
+    email: str | None = None
+    email_masked: str | None = None
+    status: str | None = None  # "activated" | "pending" | "removed" | "suppressed"
+    is_primary: bool = False
+    added_at: datetime | None = None
+    activated_at: datetime | None = None
+    removed_at: datetime | None = None
+    last_activation_sent_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class EmailListResponse(_BaseResponse):
+    emails: list[EmailAddress] = Field(default_factory=list)
+
+
+class RemoveEmailResponse(_BaseResponse):
+    email_id: str | None = None
+    new_primary_email_id: str | None = None
+
+
+class SetPrimaryEmailResponse(_BaseResponse):
+    email_id: str | None = None
+    status: str | None = None
+
+
 class DelegatedSession(_AuthModel):
     """Result of a successful delegated-auth resolution.
 

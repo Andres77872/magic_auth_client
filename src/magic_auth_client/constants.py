@@ -8,7 +8,7 @@ semantic names. ``ERROR_CODE_NAMES`` lets callers branch on the friendly name in
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Defaults ---------------------------------------------------------------------
 DEFAULT_BASE_URL = "http://localhost:8005"
@@ -26,12 +26,25 @@ PATH_REFRESH = "/auth/refresh"
 PATH_SWITCH_PROJECT = "/auth/switch-project"
 PATH_CHECK_AVAILABILITY = "/auth/check-availability"
 PATH_PROFILE = "/users/profile"
+# Google OAuth (agnostic legs only — the BFF owns provider-init + the browser return) -
+PATH_GOOGLE_OAUTH_START = "/auth/google/start"
+PATH_GOOGLE_OAUTH_CALLBACK = "/auth/google/callback"
+# Password & email workflows (no env overrides; resolved against base_url) ----------
+PATH_PASSWORD_FORGOT = "/auth/password/forgot"
+PATH_PASSWORD_RESET = "/auth/password/reset"
+PATH_PASSWORD_CHANGE = "/auth/password/change"
+PATH_EMAIL_VERIFY = "/auth/email/verify"
+PATH_USER_EMAILS = "/users/me/emails"
 
 # Header / cookie names --------------------------------------------------------
 HEADER_AUTHORIZATION = "Authorization"
 HEADER_API_KEY = "X-API-Key"
 HEADER_USER_AGENT = "User-Agent"
 HEADER_ACCEPT = "Accept"
+# Origin of the end-user's browser, relayed by a reverse-proxy/BFF consumer so the
+# provider can build agnostic user-facing links (email activation / password reset)
+# from where the user actually is, instead of its own bind address.
+HEADER_PUBLIC_BASE_URL = "X-Public-Base-Url"
 COOKIE_SESSION = "session_token"
 COOKIE_REFRESH = "refresh_token"
 

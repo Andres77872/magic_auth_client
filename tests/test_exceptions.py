@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from magic_auth_client import (
+    AuthApiError,
     AuthBadRequestError,
     AuthConflictError,
     AuthForbiddenError,
@@ -111,6 +112,50 @@ async def test_plain_text_body_is_surfaced(make_client, recorder):
     with pytest.raises(AuthValidationError) as ei:
         await client.login("a", "b", project_hash="P")
     assert ei.value.message == "plain provider text"
+
+
+async def test_change_password_wrong_current_maps_to_unauthorized(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(401, json=envelope("AUTH_1001", message="Invalid credentials"))
+    )
+    client = make_client(rec)
+    with pytest.raises(AuthUnauthorizedError) as ei:
+        await client.change_password("tok", "wrong", "NewPassw0rd!")
+    assert ei.value.error_name == "INVALID_CREDENTIALS"
+
+
+async def test_reset_password_weak_maps_to_validation(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(422, json=envelope("VAL_3007", message="Password too weak", category="validation"))
+    )
+    client = make_client(rec)
+    with pytest.raises(AuthValidationError) as ei:
+        await client.reset_password("lid.secret", "123")
+    assert ei.value.error_name == "WEAK_PASSWORD"
+
+
+async def test_change_password_rate_limited_carries_retry_after(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(
+            429,
+            json={
+                "status": "error",
+                "error": {
+                    "code": "INT_7005",
+                    "category": "internal",
+                    "message": "Too many attempts",
+                    "details": {"retry_after_seconds": 42},
+                },
+            },
+        )
+    )
+    client = make_client(rec)
+    with pytest.raises(AuthApiError) as ei:
+        await client.change_password("tok", "Old1!", "New2!")
+    exc = ei.value
+    assert exc.status_code == 429
+    assert exc.error_name == "RATE_LIMIT_EXCEEDED"
+    assert exc.details == {"retry_after_seconds": 42}
 
 
 async def test_transport_error(make_client, recorder):

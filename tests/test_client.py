@@ -8,11 +8,15 @@ import httpx
 import pytest
 
 from magic_auth_client import (
+    ChangePasswordResponse,
     CheckAvailabilityResponse,
+    EmailListResponse,
     LoginResponse,
     LogoutResponse,
     MagicAuthConfig,
     RegisterResponse,
+    RemoveEmailResponse,
+    SetPrimaryEmailResponse,
     SwitchProjectResponse,
     UserProfileResponse,
     ValidateApiKeyResponse,
@@ -234,4 +238,142 @@ async def test_get_profile(make_client, recorder):
     assert isinstance(resp, UserProfileResponse)
     assert str(rec.last.url) == "http://auth.test/users/profile"
     assert rec.last.method == "GET"
+    assert rec.last.headers["authorization"] == "Bearer tok"
+
+
+# Password & email workflows ---------------------------------------------------
+def _accepted(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(202, json={"success": True, "message": "If the request can be processed, it has been accepted."})
+
+
+async def test_forgot_password_form_no_auth(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.forgot_password("alice@example.com")
+    assert rec.last.method == "POST"
+    assert str(rec.last.url) == "http://auth.test/auth/password/forgot"
+    assert form(rec.last)["email_or_username"] == ["alice@example.com"]
+    assert "authorization" not in rec.last.headers
+    assert "x-public-base-url" not in rec.last.headers
+
+
+async def test_forgot_password_forwards_public_base_url(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.forgot_password(
+        "alice@example.com", public_base_url="http://192.168.1.13:5173"
+    )
+    assert rec.last.headers["x-public-base-url"] == "http://192.168.1.13:5173"
+
+
+async def test_reset_password_form_no_auth(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.reset_password("lid.secret", "NewPassw0rd!")
+    assert str(rec.last.url) == "http://auth.test/auth/password/reset"
+    body = form(rec.last)
+    assert body["token"] == ["lid.secret"]
+    assert body["new_password"] == ["NewPassw0rd!"]
+    assert "authorization" not in rec.last.headers
+
+
+async def test_change_password_sends_bearer_and_form(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True, "message": "Password changed successfully"}))
+    client = make_client(rec)
+    resp = await client.change_password("tok", "Old1!", "New2!")
+    assert isinstance(resp, ChangePasswordResponse)
+    assert str(rec.last.url) == "http://auth.test/auth/password/change"
+    assert rec.last.headers["authorization"] == "Bearer tok"
+    body = form(rec.last)
+    assert body["current_password"] == ["Old1!"]
+    assert body["new_password"] == ["New2!"]
+
+
+async def test_verify_email_form_no_auth(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.verify_email("lid.secret")
+    assert str(rec.last.url) == "http://auth.test/auth/email/verify"
+    assert form(rec.last)["token"] == ["lid.secret"]
+    assert "authorization" not in rec.last.headers
+
+
+async def test_list_emails_get_bearer(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(
+            200,
+            json={"success": True, "emails": [{"id": "E1", "email_masked": "a***@x.io", "status": "activated", "is_primary": True}]},
+        )
+    )
+    client = make_client(rec)
+    resp = await client.list_emails("tok")
+    assert isinstance(resp, EmailListResponse)
+    assert resp.emails[0].id == "E1"
+    assert resp.emails[0].is_primary is True
+    assert rec.last.method == "GET"
+    assert str(rec.last.url) == "http://auth.test/users/me/emails"
+    assert rec.last.headers["authorization"] == "Bearer tok"
+
+
+async def test_add_email_post_bearer(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.add_email("tok", "new@example.com")
+    assert str(rec.last.url) == "http://auth.test/users/me/emails"
+    assert rec.last.method == "POST"
+    assert form(rec.last)["email"] == ["new@example.com"]
+    assert rec.last.headers["authorization"] == "Bearer tok"
+    assert "x-public-base-url" not in rec.last.headers
+
+
+async def test_add_email_forwards_public_base_url(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.add_email(
+        "tok", "new@example.com", public_base_url="http://192.168.1.13:5173"
+    )
+    assert rec.last.headers["authorization"] == "Bearer tok"
+    assert rec.last.headers["x-public-base-url"] == "http://192.168.1.13:5173"
+
+
+async def test_resend_email_activation(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.resend_email_activation("tok", "E1")
+    assert str(rec.last.url) == "http://auth.test/users/me/emails/E1/resend"
+    assert rec.last.method == "POST"
+    assert rec.last.headers["authorization"] == "Bearer tok"
+    assert "x-public-base-url" not in rec.last.headers
+
+
+async def test_resend_email_activation_forwards_public_base_url(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.resend_email_activation(
+        "tok", "E1", public_base_url="http://192.168.1.13:5173"
+    )
+    assert rec.last.headers["authorization"] == "Bearer tok"
+    assert rec.last.headers["x-public-base-url"] == "http://192.168.1.13:5173"
+
+
+async def test_remove_email_delete(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(200, json={"success": True, "email_id": "E1", "new_primary_email_id": "E2"})
+    )
+    client = make_client(rec)
+    resp = await client.remove_email("tok", "E1")
+    assert isinstance(resp, RemoveEmailResponse)
+    assert resp.new_primary_email_id == "E2"
+    assert rec.last.method == "DELETE"
+    assert str(rec.last.url) == "http://auth.test/users/me/emails/E1"
+    assert rec.last.headers["authorization"] == "Bearer tok"
+
+
+async def test_set_primary_email(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True, "email_id": "E1", "status": "primary_changed"}))
+    client = make_client(rec)
+    resp = await client.set_primary_email("tok", "E1")
+    assert isinstance(resp, SetPrimaryEmailResponse)
+    assert str(rec.last.url) == "http://auth.test/users/me/emails/E1/primary"
+    assert rec.last.method == "POST"
     assert rec.last.headers["authorization"] == "Bearer tok"
