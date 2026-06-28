@@ -58,6 +58,43 @@ class ApiKeyInfo(_AuthModel):
     public_id: str | None = None
 
 
+class SessionPlan(_AuthModel):
+    """Subscription-only plan projection embedded in identity/session responses.
+
+    Mirrors ``api.auth`` ``SessionPlanStatus``. ``state`` is one of
+    none|free|trial|active|past_due|canceled for the session's project (resolved through
+    its billing group). Subscriptions only; packages/credits are consumer-owned.
+    """
+
+    provider: str | None = None
+    state: str = "none"
+    active: bool = False
+    plan_code: str | None = None
+    tier_code: str | None = None
+    current_period_end: datetime | None = None
+    trial_end: datetime | None = None
+    cancel_at_period_end: bool = False
+
+
+class BillingCatalogItem(_AuthModel):
+    """A subscription plan or credit package from a project's centralized catalog."""
+
+    item_type: str | None = None  # subscription_plan | credit_package
+    plan_code: str | None = None
+    credit_product_code: str | None = None
+    tier_code: str | None = None
+    tier_name: str | None = None
+    display_name: str | None = None
+    amount_cents: int | None = None
+    currency: str | None = None
+    interval: str | None = None
+    credits: int | None = None
+    provider: str | None = None
+    provider_price_lookup_key: str | None = None
+    features: dict[str, Any] = Field(default_factory=dict)
+    active: bool = True
+
+
 class _BaseResponse(_AuthModel):
     success: bool = True
     message: str | None = None
@@ -93,6 +130,7 @@ class LoginResponse(_BaseResponse, TokenPair):
     project: ProjectInfo | None = None
     accessible_projects: list[ProjectInfo] = Field(default_factory=list)
     user_groups: list[UserGroupInfo] = Field(default_factory=list)
+    plan: SessionPlan | None = None
     user_id: str | None = None
 
 
@@ -109,6 +147,7 @@ class ValidateSessionResponse(_BaseResponse):
     project: ProjectInfo | None = None
     session: dict[str, Any] | None = None
     user_groups: list[str] = Field(default_factory=list)
+    plan: SessionPlan | None = None
 
 
 class ValidateApiKeyResponse(_BaseResponse):
@@ -119,6 +158,17 @@ class ValidateApiKeyResponse(_BaseResponse):
     api_key: ApiKeyInfo | None = None
     user_groups: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
+    plan: SessionPlan | None = None
+
+
+class BillingCatalogResponse(_BaseResponse):
+    """Per-project catalog listing (subscriptions + credit packages)."""
+
+    project_hash: str | None = None
+    billing_group_hash: str | None = None
+    provider: str | None = None
+    subscriptions: list[BillingCatalogItem] = Field(default_factory=list)
+    credit_packs: list[BillingCatalogItem] = Field(default_factory=list)
 
 
 class LogoutResponse(_BaseResponse):

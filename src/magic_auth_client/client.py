@@ -18,6 +18,7 @@ from . import constants
 from .config import MagicAuthConfig
 from .exceptions import AuthTransportError, DelegationError, parse_error_response
 from .models import (
+    BillingCatalogResponse,
     ChangePasswordResponse,
     CheckAvailabilityResponse,
     DelegatedSession,
@@ -255,6 +256,28 @@ class MagicAuthClient:
             self._config.validate_api_key_endpoint,
             model=ValidateApiKeyResponse,
             headers={constants.HEADER_API_KEY: api_key},
+        )
+
+    async def get_billing_catalog(
+        self,
+        *,
+        project_hash: str,
+        bearer_token: str,
+        provider: str = "stripe",
+    ) -> BillingCatalogResponse:
+        """List a project's centralized billing catalog (subscriptions + credit packs).
+
+        This is a server-to-server read on the internal billing surface; ``bearer_token``
+        is the billing S2S bearer (not a user session token). The catalog carries no
+        secrets — only display info, opaque ``features``, and the price ``lookup_key``.
+        """
+        url = f"{self._config.base_url.rstrip('/')}/internal/projects/{project_hash}/billing/catalog"
+        return await self._request(
+            "GET",
+            url,
+            model=BillingCatalogResponse,
+            params={"provider": provider},
+            headers={constants.HEADER_AUTHORIZATION: f"Bearer {bearer_token}"},
         )
 
     async def logout(

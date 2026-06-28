@@ -377,3 +377,83 @@ async def test_set_primary_email(make_client, recorder):
     assert str(rec.last.url) == "http://auth.test/users/me/emails/E1/primary"
     assert rec.last.method == "POST"
     assert rec.last.headers["authorization"] == "Bearer tok"
+
+
+async def test_validate_parses_plan(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(
+            200,
+            json={
+                "success": True,
+                "valid": True,
+                "plan": {"state": "active", "active": True, "plan_code": "pro", "tier_code": "pro"},
+            },
+        )
+    )
+    client = make_client(rec)
+    resp = await client.validate(token="t")
+
+    assert isinstance(resp, ValidateSessionResponse)
+    assert resp.plan is not None
+    assert resp.plan.state == "active"
+    assert resp.plan.active is True
+    assert resp.plan.plan_code == "pro"
+
+
+async def test_validate_without_plan_is_backward_compatible(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True, "valid": True}))
+    client = make_client(rec)
+    resp = await client.validate(token="t")
+    assert resp.valid is True
+    assert resp.plan is None
+
+
+async def test_get_billing_catalog_request_and_parse(make_client, recorder):
+    from magic_auth_client import BillingCatalogResponse
+
+    rec = recorder(
+        lambda r: httpx.Response(
+            200,
+            json={
+                "success": True,
+                "project_hash": "P1",
+                "billing_group_hash": "G1",
+                "provider": "stripe",
+                "subscriptions": [
+                    {
+                        "item_type": "subscription_plan",
+                        "plan_code": "plus",
+                        "display_name": "Plus",
+                        "amount_cents": 999,
+                        "interval": "month",
+                        "provider_price_lookup_key": "plus_monthly",
+                        "features": {"daily_credit_limit": 100},
+                    }
+                ],
+                "credit_packs": [
+                    {
+                        "item_type": "credit_package",
+                        "credit_product_code": "payg_100",
+                        "display_name": "100 credits",
+                        "amount_cents": 500,
+                        "credits": 100,
+                        "features": {"credits": 100},
+                    }
+                ],
+            },
+        )
+    )
+    client = make_client(rec)
+    resp = await client.get_billing_catalog(project_hash="P1", bearer_token="s2s-token")
+
+    assert isinstance(resp, BillingCatalogResponse)
+    assert resp.subscriptions[0].plan_code == "plus"
+    assert resp.subscriptions[0].provider_price_lookup_key == "plus_monthly"
+    assert resp.subscriptions[0].features["daily_credit_limit"] == 100
+    assert resp.credit_packs[0].credit_product_code == "payg_100"
+    assert resp.credit_packs[0].credits == 100
+
+    req = rec.last
+    assert req.method == "GET"
+    assert str(req.url).startswith("http://auth.test/internal/projects/P1/billing/catalog")
+    assert req.headers["authorization"] == "Bearer s2s-token"

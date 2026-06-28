@@ -25,6 +25,8 @@ from .exceptions import (
 )
 from .models import (
     ApiKeyInfo,
+    BillingCatalogItem,
+    BillingCatalogResponse,
     ChangePasswordResponse,
     CheckAvailabilityResponse,
     DelegatedSession,
@@ -43,6 +45,7 @@ from .models import (
     UserProfileResponse,
     ValidateApiKeyResponse,
     ValidateSessionResponse,
+    SessionPlan,
 )
 
 __all__ = [
@@ -53,6 +56,9 @@ __all__ = [
     "parse_trusted_clients",
     # models
     "ApiKeyInfo",
+    "BillingCatalogItem",
+    "BillingCatalogResponse",
+    "SessionPlan",
     "ChangePasswordResponse",
     "CheckAvailabilityResponse",
     "DelegatedSession",
