@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from magic_auth_client import LoginResponse, ValidateSessionResponse
-from magic_auth_client.models import TokenPair
+from magic_auth_client import ActionResponse, LoginResponse, ValidateSessionResponse
+from magic_auth_client.models import TokenPair, _BaseResponse
 
 
 def test_extra_fields_ignored():
@@ -28,6 +28,13 @@ def test_token_pair_defaults():
     assert tp.token_type == "Bearer"
     assert tp.access_token is None
     assert tp.refresh_token is None
+    assert tp.remember_me is False
+
+
+def test_action_response_is_public_and_private_name_is_compatibility_alias():
+    response = ActionResponse(success=True, message="accepted")
+    assert response.message == "accepted"
+    assert _BaseResponse is ActionResponse
 
 
 def test_login_response_collection_defaults():

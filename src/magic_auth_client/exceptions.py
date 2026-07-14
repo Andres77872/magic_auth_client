@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 
-from .constants import ERROR_CODE_NAMES
+from .constants import ERROR_CODE_NAMES, HEADER_RETRY_AFTER
 
 
 class MagicAuthError(Exception):
@@ -50,6 +50,9 @@ class AuthApiError(MagicAuthError):
         category: Error category from the app envelope, e.g. ``"authentication"``.
         message: Human-readable message.
         details: Optional structured details (DEBUG mode or FastAPI validation list).
+        retry_after: Raw ``Retry-After`` response-header value, including HTTP dates.
+        retry_after_seconds: Provider-supplied retry delay normalized to seconds when
+            available in structured details or as a delta-seconds header.
         raw: The full decoded body, for escape-hatch access.
     """
 
@@ -62,6 +65,8 @@ class AuthApiError(MagicAuthError):
         error_name: str | None = None,
         category: str | None = None,
         details: dict[str, Any] | None = None,
+        retry_after: str | None = None,
+        retry_after_seconds: int | None = None,
         raw: Any = None,
     ) -> None:
         super().__init__(message)
@@ -71,6 +76,8 @@ class AuthApiError(MagicAuthError):
         self.error_name = error_name
         self.category = category
         self.details = details
+        self.retry_after = retry_after
+        self.retry_after_seconds = retry_after_seconds
         self.raw = raw
 
     def __str__(self) -> str:
@@ -139,6 +146,19 @@ _STATUS_TO_EXC: dict[int, type[AuthApiError]] = {
 }
 
 
+def _parse_retry_after_seconds(value: Any) -> int | None:
+    """Return a non-negative delta-seconds value without interpreting HTTP dates."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isascii() and stripped.isdecimal():
+            return int(stripped)
+    return None
+
+
 def parse_error_response(response: httpx.Response) -> AuthApiError:
     """Map a non-2xx ``httpx.Response`` to the appropriate :class:`AuthApiError`."""
     status = response.status_code
@@ -151,6 +171,7 @@ def parse_error_response(response: httpx.Response) -> AuthApiError:
     error_name: str | None = None
     category: str | None = None
     details: dict[str, Any] | None = None
+    retry_after = response.headers.get(HEADER_RETRY_AFTER)
     message = response.reason_phrase or "request failed"
 
     if isinstance(body, dict) and body.get("status") == "error" and isinstance(body.get("error"), dict):
@@ -189,6 +210,12 @@ def parse_error_response(response: httpx.Response) -> AuthApiError:
     else:
         cls = AuthApiError
 
+    retry_after_seconds = _parse_retry_after_seconds(
+        details.get("retry_after_seconds") if details else None
+    )
+    if retry_after_seconds is None:
+        retry_after_seconds = _parse_retry_after_seconds(retry_after)
+
     return cls(
         status_code=status,
         message=message,
@@ -196,5 +223,7 @@ def parse_error_response(response: httpx.Response) -> AuthApiError:
         error_name=error_name,
         category=category,
         details=details,
+        retry_after=retry_after,
+        retry_after_seconds=retry_after_seconds,
         raw=body,
     )

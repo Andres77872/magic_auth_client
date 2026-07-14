@@ -93,8 +93,8 @@ All methods are `async` and return a typed pydantic model.
 
 | Method | Endpoint | Notes |
 |---|---|---|
-| `login(username, password, *, project_hash=None)` | `POST /auth/login` | `project_hash` required (or config default) |
-| `platform_login(username, password)` | `POST /auth/platform/login` | root/admin, no project |
+| `login(username, password, *, project_hash=None, remember_me=False)` | `POST /auth/login` | `project_hash` required (or config default) |
+| `platform_login(username, password, *, remember_me=False)` | `POST /auth/platform/login` | root/admin, no project |
 | `register(username, password, *, email=None, user_group_hash=None)` | `POST /auth/register` | `user_group_hash` required (or config default) |
 | `validate(*, token=None, session_token=None)` | `GET /auth/validate` | Bearer or `session_token` cookie; 200/`valid=False` not raised |
 | `validate_api_key(api_key)` | `POST /auth/validate-api-key` | `X-API-Key` only; never sends `Authorization` |
@@ -103,20 +103,32 @@ All methods are `async` and return a typed pydantic model.
 | `switch_project(access_token, project_hash, *, refresh_token=None)` | `POST /auth/switch-project` | Bearer header + form body |
 | `check_availability(*, username=None, email=None)` | `POST /auth/check-availability` | |
 | `get_profile(token)` | `GET /users/profile` | |
-| `forgot_password(email_or_username)` | `POST /auth/password/forgot` | no auth; provider returns a generic 202 (no enumeration) |
+| `forgot_password(email_or_username, *, idempotency_key=None)` | `POST /auth/password/forgot` | no auth; optional `Idempotency-Key`; generic 202 (no enumeration) |
 | `reset_password(token, new_password)` | `POST /auth/password/reset` | no auth; weak password raises `WEAK_PASSWORD`; revokes all sessions, mints none |
 | `change_password(token, current_password, new_password)` | `POST /auth/password/change` | Bearer; wrong current → `INVALID_CREDENTIALS`; preserves current session |
 | `verify_email(token)` | `POST /auth/email/verify` | no auth; generic 202; revokes sessions on success |
 | `list_emails(token)` | `GET /users/me/emails` | Bearer |
-| `add_email(token, email)` | `POST /users/me/emails` | Bearer; enqueues an activation link |
-| `resend_email_activation(token, email_id)` | `POST /users/me/emails/{id}/resend` | Bearer; cooldown-limited |
+| `add_email(token, email, *, idempotency_key=None)` | `POST /users/me/emails` | Bearer; optional `Idempotency-Key`; enqueues an activation link |
+| `resend_email_activation(token, email_id, *, idempotency_key=None)` | `POST /users/me/emails/{id}/resend` | Bearer; optional `Idempotency-Key`; cooldown-limited |
 | `remove_email(token, email_id)` | `DELETE /users/me/emails/{id}` | Bearer; promotes next primary |
 | `set_primary_email(token, email_id)` | `POST /users/me/emails/{id}/primary` | Bearer; address must be activated |
 | `start_google_oauth(provider_init_token, *, redirect_uri, return_origin, remember_me=False)` | `POST /auth/google/start` | returns Google's authorization URL (the 303 `Location`; not followed) |
 | `complete_google_oauth(code, state)` | `GET /auth/google/callback` | server-to-server; returns a `LoginResponse` |
 | `validate_delegated_session(*, delegation_api_key, session_token, …)` | `validate-api-key` + `validate` | see [Delegated auth](#delegated-auth) |
 
-**Email login** needs no new method: `login()` already forwards the `username` field verbatim, and the provider accepts an **activated email** there. A 429 rate-limit surfaces as a base `AuthApiError(status_code=429)` whose `.details` carries `retry_after_seconds` (the raw `Retry-After` header is not captured by the client).
+**Email login** needs no new method: `login()` already forwards the `username` field
+verbatim, and the provider accepts an **activated email** there. Password login and
+platform login send `remember_me`; credential responses expose the provider's resolved
+value as `TokenPair.remember_me`.
+
+Action-only password/email methods return the public `ActionResponse` model. For email
+enqueue operations, reuse a stable `idempotency_key` when retrying the same logical
+request; the client forwards it as `Idempotency-Key`.
+
+Consumer-facing auth methods also accept an optional `client_ip`. It is forwarded as
+`X-Forwarded-For` so a trusted BFF can preserve end-user rate-limit attribution. Only
+pass an address derived from the server-observed peer after applying the deployment's
+trusted-proxy policy; never copy a browser-supplied forwarding header into this field.
 
 **Google sign-in** exposes only the two *agnostic* legs (`start_google_oauth` / `complete_google_oauth`). The project-specific concerns — minting the opaque `provider_init_token`, the browser entry/return, the one-time delivery code, and the session cookie — belong to the consuming BFF, not this client. `start_google_oauth` does **not** follow the `303`; it returns Google's authorization URL for the BFF to hand to the browser. `complete_google_oauth` is a server-to-server call (no browser cookies) and returns the same `LoginResponse` as password login, including the refresh token.
 
@@ -176,7 +188,8 @@ Transport failures raise `AuthTransportError`. Any non-2xx response raises an
 ```
 MagicAuthError
 ├── AuthTransportError                # network/timeout/unparseable response
-└── AuthApiError(status_code, error_code, error_name, category, message, details, raw)
+└── AuthApiError(status_code, error_code, error_name, category, message, details,
+                 retry_after, retry_after_seconds, raw)
     ├── AuthBadRequestError      # 400 (incl. ambiguous_credentials)
     ├── AuthUnauthorizedError    # 401
     ├── AuthForbiddenError       # 403
@@ -194,6 +207,13 @@ except AuthUnauthorizedError as e:
     if e.error_name == "REFRESH_TOKEN_MISMATCH":   # or e.error_code == "AUTH_1016"
         ...
 ```
+
+Rate-limited responses preserve the raw `Retry-After` header in `.retry_after`.
+`.retry_after_seconds` prefers the structured provider
+`details.retry_after_seconds` value and otherwise parses a delta-seconds header; an
+HTTP-date remains available only in `.retry_after`. Invalid JSON raises
+`AuthTransportError`; a syntactically valid but malformed 2xx response preserves
+Pydantic's `ValidationError` for backward compatibility with existing consumers.
 
 ## Notes / non-goals
 
@@ -219,7 +239,7 @@ consumer because they are stateful and deployment-specific (both `api.magic_llm`
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest -p no:cacheprovider
 ```
 
 Tests run fully offline using `httpx.MockTransport` — no live auth service needed.

@@ -18,6 +18,7 @@ from . import constants
 from .config import MagicAuthConfig
 from .exceptions import AuthTransportError, DelegationError, parse_error_response
 from .models import (
+    ActionResponse,
     BillingCatalogResponse,
     ChangePasswordResponse,
     CheckAvailabilityResponse,
@@ -32,31 +33,42 @@ from .models import (
     UserProfileResponse,
     ValidateApiKeyResponse,
     ValidateSessionResponse,
-    _BaseResponse,
 )
 
 _M = TypeVar("_M", bound=BaseModel)
 
 
-def _ua_override(user_agent: str | None) -> dict[str, str] | None:
+def _ua_override(
+    user_agent: str | None,
+    client_ip: str | None = None,
+) -> dict[str, str] | None:
     """Build a one-off ``User-Agent`` header override, or ``None`` to use the config
     default. Used by the auth-forwarding methods so a reverse-proxy consumer can relay
     the original caller's User-Agent to the provider."""
-    return {constants.HEADER_USER_AGENT: user_agent} if user_agent else None
+    headers: dict[str, str] = {}
+    if user_agent:
+        headers[constants.HEADER_USER_AGENT] = user_agent
+    if client_ip:
+        headers[constants.HEADER_FORWARDED_FOR] = client_ip
+    return headers or None
 
 
 def _link_overrides(
-    user_agent: str | None, public_base_url: str | None
+    user_agent: str | None,
+    public_base_url: str | None,
+    idempotency_key: str | None = None,
+    client_ip: str | None = None,
 ) -> dict[str, str] | None:
-    """Combine the optional ``User-Agent`` and ``X-Public-Base-Url`` overrides into a
-    single header dict (or ``None`` when neither is set). A reverse-proxy/BFF consumer
-    relays the end-user's browser origin via ``public_base_url`` so the provider builds
-    user-facing links from where the user actually is, not its own bind address."""
+    """Build optional headers for user-facing email-link requests."""
     headers: dict[str, str] = {}
     if user_agent:
         headers[constants.HEADER_USER_AGENT] = user_agent
     if public_base_url:
         headers[constants.HEADER_PUBLIC_BASE_URL] = public_base_url
+    if idempotency_key:
+        headers[constants.HEADER_IDEMPOTENCY_KEY] = idempotency_key
+    if client_ip:
+        headers[constants.HEADER_FORWARDED_FOR] = client_ip
     return headers or None
 
 
@@ -153,6 +165,10 @@ class MagicAuthClient:
                 "Invalid JSON response from auth service", cause=exc
             ) from exc
 
+        # Preserve the established client contract: syntactically valid JSON
+        # with the wrong endpoint schema raises Pydantic's ValidationError.
+        # Existing consumers use that distinction to fail closed without
+        # treating a malformed 200 as provider unavailability.
         return model.model_validate(payload)
 
     # Authentication flows -----------------------------------------------------
@@ -162,31 +178,46 @@ class MagicAuthClient:
         password: str,
         *,
         project_hash: str | None = None,
+        remember_me: bool = False,
         user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> LoginResponse:
         """Project-scoped login. ``project_hash`` is required by the provider for all
-        users; falls back to ``config.project_hash`` when omitted. ``user_agent``
-        overrides the configured User-Agent for this call (e.g. to relay a caller's)."""
+        users; falls back to ``config.project_hash`` when omitted. ``remember_me``
+        selects the provider's longer-lived refresh policy. ``user_agent`` overrides
+        the configured User-Agent for this call (e.g. to relay a caller's)."""
         resolved = project_hash or self._config.project_hash
         if not resolved:
             raise ValueError(
                 "project_hash is required for login: pass it or set config.project_hash"
             )
+        data: dict[str, Any] = {
+            "username": username,
+            "password": password,
+            "project_hash": resolved,
+        }
+        if remember_me:
+            data["remember_me"] = True
         return await self._request(
             "POST",
             self._config.login_endpoint,
             model=LoginResponse,
-            data={"username": username, "password": password, "project_hash": resolved},
-            headers=_ua_override(user_agent),
+            data=data,
+            headers=_ua_override(user_agent, client_ip),
         )
 
-    async def platform_login(self, username: str, password: str) -> LoginResponse:
+    async def platform_login(
+        self, username: str, password: str, *, remember_me: bool = False
+    ) -> LoginResponse:
         """Login for root/admin users without project scope (dashboard access)."""
+        data: dict[str, Any] = {"username": username, "password": password}
+        if remember_me:
+            data["remember_me"] = True
         return await self._request(
             "POST",
             self._config.platform_login_endpoint,
             model=LoginResponse,
-            data={"username": username, "password": password},
+            data=data,
         )
 
     async def register(
@@ -197,6 +228,7 @@ class MagicAuthClient:
         email: str | None = None,
         user_group_hash: str | None = None,
         user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> RegisterResponse:
         """Register a new user. ``user_group_hash`` is required by the provider;
         falls back to ``config.user_group_hash`` when omitted. ``user_agent`` overrides
@@ -216,7 +248,7 @@ class MagicAuthClient:
                 "email": email,
                 "user_group_hash": resolved,
             },
-            headers=_ua_override(user_agent),
+            headers=_ua_override(user_agent, client_ip),
         )
 
     async def validate(
@@ -286,6 +318,7 @@ class MagicAuthClient:
         token: str | None = None,
         session_token: str | None = None,
         user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> LogoutResponse:
         """Invalidate the session and revoke its refresh family. ``user_agent``
         overrides the configured User-Agent for this call."""
@@ -299,6 +332,8 @@ class MagicAuthClient:
             cookies = {constants.COOKIE_SESSION: session_token}  # type: ignore[dict-item]
         if user_agent:
             headers[constants.HEADER_USER_AGENT] = user_agent
+        if client_ip:
+            headers[constants.HEADER_FORWARDED_FOR] = client_ip
         return await self._request(
             "POST",
             self._config.logout_endpoint,
@@ -308,7 +343,12 @@ class MagicAuthClient:
         )
 
     async def refresh(
-        self, refresh_token: str, *, use_cookie: bool = False, user_agent: str | None = None
+        self,
+        refresh_token: str,
+        *,
+        use_cookie: bool = False,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> LoginResponse:
         """Rotate the refresh family and issue a new token pair.
 
@@ -322,14 +362,14 @@ class MagicAuthClient:
                 self._config.refresh_endpoint,
                 model=LoginResponse,
                 cookies={constants.COOKIE_REFRESH: refresh_token},
-                headers=_ua_override(user_agent),
+                headers=_ua_override(user_agent, client_ip),
             )
         return await self._request(
             "POST",
             self._config.refresh_endpoint,
             model=LoginResponse,
             data={"refresh_token": refresh_token},
-            headers=_ua_override(user_agent),
+            headers=_ua_override(user_agent, client_ip),
         )
 
     async def switch_project(
@@ -464,7 +504,9 @@ class MagicAuthClient:
         *,
         user_agent: str | None = None,
         public_base_url: str | None = None,
-    ) -> _BaseResponse:
+        idempotency_key: str | None = None,
+        client_ip: str | None = None,
+    ) -> ActionResponse:
         """Request a password-reset email by email or username.
 
         Unauthenticated. The provider responds with a generic accepted body
@@ -472,19 +514,30 @@ class MagicAuthClient:
         discloses account existence). ``user_agent`` overrides the configured
         User-Agent for this call. ``public_base_url`` relays the end-user's
         browser origin so the emailed reset link points there (the provider
-        validates it against its allowlist).
+        validates it against its allowlist). ``idempotency_key`` is forwarded as
+        ``Idempotency-Key`` so callers can safely retry the same enqueue request.
         """
         return await self._request(
             "POST",
             self._config.password_forgot_endpoint,
-            model=_BaseResponse,
+            model=ActionResponse,
             data={"email_or_username": email_or_username},
-            headers=_link_overrides(user_agent, public_base_url),
+            headers=_link_overrides(
+                user_agent,
+                public_base_url,
+                idempotency_key,
+                client_ip,
+            ),
         )
 
     async def reset_password(
-        self, token: str, new_password: str, *, user_agent: str | None = None
-    ) -> _BaseResponse:
+        self,
+        token: str,
+        new_password: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> ActionResponse:
         """Consume a password-reset link token and set a new password.
 
         Unauthenticated; ``token`` is the ``lookup_id.secret`` value from the
@@ -496,9 +549,9 @@ class MagicAuthClient:
         return await self._request(
             "POST",
             self._config.password_reset_endpoint,
-            model=_BaseResponse,
+            model=ActionResponse,
             data={"token": token, "new_password": new_password},
-            headers=_ua_override(user_agent),
+            headers=_ua_override(user_agent, client_ip),
         )
 
     async def change_password(
@@ -508,6 +561,7 @@ class MagicAuthClient:
         new_password: str,
         *,
         user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> ChangePasswordResponse:
         """Change the authenticated user's password (Bearer ``token``).
 
@@ -520,6 +574,8 @@ class MagicAuthClient:
         headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
         if user_agent:
             headers[constants.HEADER_USER_AGENT] = user_agent
+        if client_ip:
+            headers[constants.HEADER_FORWARDED_FOR] = client_ip
         return await self._request(
             "POST",
             self._config.password_change_endpoint,
@@ -530,8 +586,12 @@ class MagicAuthClient:
 
     # Email workflows ----------------------------------------------------------
     async def verify_email(
-        self, token: str, *, user_agent: str | None = None
-    ) -> _BaseResponse:
+        self,
+        token: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> ActionResponse:
         """Consume an email-activation link token.
 
         Unauthenticated; ``token`` is the ``lookup_id.secret`` value from the
@@ -542,9 +602,9 @@ class MagicAuthClient:
         return await self._request(
             "POST",
             self._config.email_verify_endpoint,
-            model=_BaseResponse,
+            model=ActionResponse,
             data={"token": token},
-            headers=_ua_override(user_agent),
+            headers=_ua_override(user_agent, client_ip),
         )
 
     async def list_emails(self, token: str) -> EmailListResponse:
@@ -563,21 +623,25 @@ class MagicAuthClient:
         *,
         user_agent: str | None = None,
         public_base_url: str | None = None,
-    ) -> _BaseResponse:
+        idempotency_key: str | None = None,
+        client_ip: str | None = None,
+    ) -> ActionResponse:
         """Add an email and enqueue an activation link (Bearer ``token``).
 
         Returns a generic accepted body on success; an invalid address raises a
         4xx. ``user_agent`` overrides the configured User-Agent for this call.
         ``public_base_url`` relays the end-user's browser origin so the emailed
         activation link points there (the provider validates it against its
-        allowlist).
+        allowlist). ``idempotency_key`` is forwarded as ``Idempotency-Key``.
         """
         headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
-        headers.update(_link_overrides(user_agent, public_base_url) or {})
+        headers.update(
+            _link_overrides(user_agent, public_base_url, idempotency_key, client_ip) or {}
+        )
         return await self._request(
             "POST",
             self._config.user_emails_endpoint,
-            model=_BaseResponse,
+            model=ActionResponse,
             data={"email": email},
             headers=headers,
         )
@@ -589,21 +653,25 @@ class MagicAuthClient:
         *,
         user_agent: str | None = None,
         public_base_url: str | None = None,
-    ) -> _BaseResponse:
+        idempotency_key: str | None = None,
+        client_ip: str | None = None,
+    ) -> ActionResponse:
         """Resend the activation link for a pending email (Bearer ``token``).
 
         Cooldown- and rate-limited by the provider; returns a generic accepted
         body. ``user_agent`` overrides the configured User-Agent for this call.
         ``public_base_url`` relays the end-user's browser origin so the emailed
         activation link points there (the provider validates it against its
-        allowlist).
+        allowlist). ``idempotency_key`` is forwarded as ``Idempotency-Key``.
         """
         headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
-        headers.update(_link_overrides(user_agent, public_base_url) or {})
+        headers.update(
+            _link_overrides(user_agent, public_base_url, idempotency_key, client_ip) or {}
+        )
         return await self._request(
             "POST",
             self._config.user_email_resend_endpoint(email_id),
-            model=_BaseResponse,
+            model=ActionResponse,
             headers=headers,
         )
 

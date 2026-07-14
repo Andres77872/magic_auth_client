@@ -95,9 +95,16 @@ class BillingCatalogItem(_AuthModel):
     active: bool = True
 
 
-class _BaseResponse(_AuthModel):
+class ActionResponse(_AuthModel):
+    """Generic result returned by provider actions without endpoint-specific data."""
+
     success: bool = True
     message: str | None = None
+
+
+# Kept as a private compatibility alias for code that imported the old implementation
+# detail. New code should use the public ``ActionResponse`` name.
+_BaseResponse = ActionResponse
 
 
 class TokenPair(_AuthModel):
@@ -111,6 +118,7 @@ class TokenPair(_AuthModel):
     refresh_expires_in: int | None = None
     expires_at: datetime | None = None
     refresh_expires_at: datetime | None = None
+    remember_me: bool = False
 
     def is_expired(self, now: datetime | None = None) -> bool | None:
         """Whether the access token is past ``expires_at``.
@@ -125,7 +133,7 @@ class TokenPair(_AuthModel):
 
 
 # Endpoint responses -----------------------------------------------------------
-class LoginResponse(_BaseResponse, TokenPair):
+class LoginResponse(ActionResponse, TokenPair):
     user: UserInfo | None = None
     project: ProjectInfo | None = None
     accessible_projects: list[ProjectInfo] = Field(default_factory=list)
@@ -134,13 +142,13 @@ class LoginResponse(_BaseResponse, TokenPair):
     user_id: str | None = None
 
 
-class RegisterResponse(_BaseResponse, TokenPair):
+class RegisterResponse(ActionResponse, TokenPair):
     user: UserInfo | None = None
     project: ProjectInfo | None = None
     user_id: str | None = None
 
 
-class ValidateSessionResponse(_BaseResponse):
+class ValidateSessionResponse(ActionResponse):
     valid: bool
     auth_method: str = "session"
     user: UserInfo | None = None
@@ -150,7 +158,7 @@ class ValidateSessionResponse(_BaseResponse):
     plan: SessionPlan | None = None
 
 
-class ValidateApiKeyResponse(_BaseResponse):
+class ValidateApiKeyResponse(ActionResponse):
     valid: bool
     auth_method: str = "api_key"
     user: UserInfo | None = None
@@ -161,7 +169,7 @@ class ValidateApiKeyResponse(_BaseResponse):
     plan: SessionPlan | None = None
 
 
-class BillingCatalogResponse(_BaseResponse):
+class BillingCatalogResponse(ActionResponse):
     """Per-project catalog listing (subscriptions + credit packages)."""
 
     project_hash: str | None = None
@@ -171,21 +179,21 @@ class BillingCatalogResponse(_BaseResponse):
     credit_packs: list[BillingCatalogItem] = Field(default_factory=list)
 
 
-class LogoutResponse(_BaseResponse):
+class LogoutResponse(ActionResponse):
     pass
 
 
-class SwitchProjectResponse(_BaseResponse, TokenPair):
+class SwitchProjectResponse(ActionResponse, TokenPair):
     project: ProjectInfo | None = None
     user_groups: list[str] = Field(default_factory=list)
 
 
-class CheckAvailabilityResponse(_BaseResponse):
+class CheckAvailabilityResponse(ActionResponse):
     username_available: bool | None = None
     email_available: bool | None = None
 
 
-class UserProfileResponse(_BaseResponse):
+class UserProfileResponse(ActionResponse):
     user_hash: str | None = None
     username: str | None = None
     email: str | None = None
@@ -199,7 +207,7 @@ class UserProfileResponse(_BaseResponse):
     projects: list[ProjectInfo] = Field(default_factory=list)
 
 
-class ChangePasswordResponse(_BaseResponse):
+class ChangePasswordResponse(ActionResponse):
     """Result of an authenticated password change (provider returns no new token)."""
 
     message: str | None = "Password changed successfully"
@@ -225,16 +233,16 @@ class EmailAddress(_AuthModel):
     updated_at: datetime | None = None
 
 
-class EmailListResponse(_BaseResponse):
+class EmailListResponse(ActionResponse):
     emails: list[EmailAddress] = Field(default_factory=list)
 
 
-class RemoveEmailResponse(_BaseResponse):
+class RemoveEmailResponse(ActionResponse):
     email_id: str | None = None
     new_primary_email_id: str | None = None
 
 
-class SetPrimaryEmailResponse(_BaseResponse):
+class SetPrimaryEmailResponse(ActionResponse):
     email_id: str | None = None
     status: str | None = None
 

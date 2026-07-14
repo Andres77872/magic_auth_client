@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "magic-auth-client"
-version = "0.2.1"
+version = "0.2.2"
 description = "Async client for the magic auth provider (api.auth)."
 readme = "README.md"
 requires-python = ">=3.10"

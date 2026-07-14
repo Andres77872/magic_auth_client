@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from magic_auth_client import (
     AuthApiError,
@@ -138,6 +139,7 @@ async def test_change_password_rate_limited_carries_retry_after(make_client, rec
     rec = recorder(
         lambda r: httpx.Response(
             429,
+            headers={"Retry-After": "60"},
             json={
                 "status": "error",
                 "error": {
@@ -156,6 +158,61 @@ async def test_change_password_rate_limited_carries_retry_after(make_client, rec
     assert exc.status_code == 429
     assert exc.error_name == "RATE_LIMIT_EXCEEDED"
     assert exc.details == {"retry_after_seconds": 42}
+    assert exc.retry_after == "60"
+    assert exc.retry_after_seconds == 42
+
+
+async def test_numeric_retry_after_header_populates_seconds(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(
+            429,
+            headers={"Retry-After": "17"},
+            json=envelope("INT_7005"),
+        )
+    )
+    client = make_client(rec)
+    with pytest.raises(AuthApiError) as ei:
+        await client.forgot_password("alice@example.com")
+
+    assert ei.value.retry_after == "17"
+    assert ei.value.retry_after_seconds == 17
+
+
+async def test_http_date_retry_after_is_preserved_without_guessing_seconds(
+    make_client, recorder
+):
+    retry_at = "Sun, 12 Jul 2026 21:15:00 GMT"
+    rec = recorder(
+        lambda r: httpx.Response(
+            429,
+            headers={"Retry-After": retry_at},
+            json=envelope("INT_7005"),
+        )
+    )
+    client = make_client(rec)
+    with pytest.raises(AuthApiError) as ei:
+        await client.forgot_password("alice@example.com")
+
+    assert ei.value.retry_after == retry_at
+    assert ei.value.retry_after_seconds is None
+
+
+async def test_email_provider_code_has_friendly_name(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(409, json=envelope("EMAIL_9005"))
+    )
+    client = make_client(rec)
+    with pytest.raises(AuthConflictError) as ei:
+        await client.add_email("tok", "new@example.com")
+    assert ei.value.error_name == "EMAIL_IDEMPOTENCY_CONFLICT"
+
+
+async def test_malformed_success_payload_preserves_validation_error(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True}))
+    client = make_client(rec)
+
+    with pytest.raises(ValidationError):
+        await client.validate(token="tok")
 
 
 async def test_transport_error(make_client, recorder):

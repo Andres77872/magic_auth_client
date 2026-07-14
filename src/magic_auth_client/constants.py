@@ -8,7 +8,7 @@ semantic names. ``ERROR_CODE_NAMES`` lets callers branch on the friendly name in
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 # Defaults ---------------------------------------------------------------------
 DEFAULT_BASE_URL = "http://localhost:8005"
@@ -41,6 +41,9 @@ HEADER_AUTHORIZATION = "Authorization"
 HEADER_API_KEY = "X-API-Key"
 HEADER_USER_AGENT = "User-Agent"
 HEADER_ACCEPT = "Accept"
+HEADER_IDEMPOTENCY_KEY = "Idempotency-Key"
+HEADER_FORWARDED_FOR = "X-Forwarded-For"
+HEADER_RETRY_AFTER = "Retry-After"
 # Origin of the end-user's browser, relayed by a reverse-proxy/BFF consumer so the
 # provider can build agnostic user-facing links (email activation / password reset)
 # from where the user actually is, instead of its own bind address.
@@ -130,4 +133,15 @@ ERROR_CODE_NAMES: dict[str, str] = {
     "EXT_8001": "EXTERNAL_SERVICE_ERROR",
     "EXT_8002": "EXTERNAL_API_ERROR",
     "EXT_8003": "EXTERNAL_TIMEOUT",
+    # Transactional auth email (9xxx)
+    "EMAIL_9001": "EMAIL_DELIVERY_DISABLED",
+    "EMAIL_9002": "EMAIL_PROVIDER_NOT_READY",
+    "EMAIL_9003": "EMAIL_REAL_SEND_BLOCKED_IN_TEST",
+    "EMAIL_9004": "EMAIL_TOKEN_INVALID",
+    "EMAIL_9005": "EMAIL_IDEMPOTENCY_CONFLICT",
+    "EMAIL_9006": "EMAIL_SUPPRESSED",
+    "EMAIL_9007": "EMAIL_WEBHOOK_INVALID",
+    "EMAIL_9008": "EMAIL_OUTBOX_FAILURE",
+    "EMAIL_9009": "EMAIL_PROVIDER_SEND_FAILED",
+    "EMAIL_9010": "EMAIL_TEMPLATE_INVALID",
 }

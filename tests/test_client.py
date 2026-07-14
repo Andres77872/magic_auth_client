@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from magic_auth_client import (
+    ActionResponse,
     ChangePasswordResponse,
     CheckAvailabilityResponse,
     EmailListResponse,
@@ -56,6 +57,30 @@ async def test_login_sends_form_and_user_agent(make_client, recorder):
     assert body["username"] == ["alice"]
     assert body["password"] == ["pw"]
     assert body["project_hash"] == ["P1"]
+    assert "remember_me" not in body
+
+
+async def test_login_forwards_remember_me_and_parses_response(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(
+            200,
+            json={"success": True, "access_token": "acc", "remember_me": True},
+        )
+    )
+    client = make_client(rec)
+    resp = await client.login("alice", "pw", remember_me=True)
+
+    assert form(rec.last)["remember_me"] == ["true"]
+    assert resp.remember_me is True
+
+
+async def test_login_forwards_trusted_client_ip(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True}))
+    client = make_client(rec)
+
+    await client.login("alice", "pw", client_ip="203.0.113.9")
+
+    assert rec.last.headers["x-forwarded-for"] == "203.0.113.9"
 
 
 async def test_login_falls_back_to_config_project_hash(make_client, recorder):
@@ -80,6 +105,18 @@ async def test_platform_login_has_no_project_hash(make_client, recorder):
     assert isinstance(resp, LoginResponse)
     assert str(rec.last.url) == "http://auth.test/auth/platform/login"
     assert "project_hash" not in form(rec.last)
+    assert "remember_me" not in form(rec.last)
+
+
+async def test_platform_login_forwards_remember_me(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(200, json={"success": True, "remember_me": True})
+    )
+    client = make_client(rec)
+    resp = await client.platform_login("root", "pw", remember_me=True)
+
+    assert form(rec.last)["remember_me"] == ["true"]
+    assert resp.remember_me is True
 
 
 async def test_register_uses_config_group_and_omits_none(make_client, recorder):
@@ -249,12 +286,23 @@ def _accepted(_request: httpx.Request) -> httpx.Response:
 async def test_forgot_password_form_no_auth(make_client, recorder):
     rec = recorder(_accepted)
     client = make_client(rec)
-    await client.forgot_password("alice@example.com")
+    resp = await client.forgot_password("alice@example.com")
+    assert isinstance(resp, ActionResponse)
     assert rec.last.method == "POST"
     assert str(rec.last.url) == "http://auth.test/auth/password/forgot"
     assert form(rec.last)["email_or_username"] == ["alice@example.com"]
     assert "authorization" not in rec.last.headers
     assert "x-public-base-url" not in rec.last.headers
+    assert "idempotency-key" not in rec.last.headers
+
+
+async def test_forgot_password_forwards_idempotency_key(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.forgot_password(
+        "alice@example.com", idempotency_key="forgot-4a90"
+    )
+    assert rec.last.headers["idempotency-key"] == "forgot-4a90"
 
 
 async def test_forgot_password_forwards_public_base_url(make_client, recorder):
@@ -336,6 +384,15 @@ async def test_add_email_forwards_public_base_url(make_client, recorder):
     assert rec.last.headers["x-public-base-url"] == "http://192.168.1.13:5173"
 
 
+async def test_add_email_forwards_idempotency_key(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.add_email(
+        "tok", "new@example.com", idempotency_key="add-email-c48f"
+    )
+    assert rec.last.headers["idempotency-key"] == "add-email-c48f"
+
+
 async def test_resend_email_activation(make_client, recorder):
     rec = recorder(_accepted)
     client = make_client(rec)
@@ -354,6 +411,15 @@ async def test_resend_email_activation_forwards_public_base_url(make_client, rec
     )
     assert rec.last.headers["authorization"] == "Bearer tok"
     assert rec.last.headers["x-public-base-url"] == "http://192.168.1.13:5173"
+
+
+async def test_resend_email_activation_forwards_idempotency_key(make_client, recorder):
+    rec = recorder(_accepted)
+    client = make_client(rec)
+    await client.resend_email_activation(
+        "tok", "E1", idempotency_key="resend-email-d84c"
+    )
+    assert rec.last.headers["idempotency-key"] == "resend-email-d84c"
 
 
 async def test_remove_email_delete(make_client, recorder):
