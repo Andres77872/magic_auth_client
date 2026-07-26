@@ -11,6 +11,7 @@ from magic_auth_client import (
     AuthBadRequestError,
     AuthConflictError,
     AuthForbiddenError,
+    AuthRateLimitError,
     AuthServerError,
     AuthTransportError,
     AuthUnauthorizedError,
@@ -152,7 +153,7 @@ async def test_change_password_rate_limited_carries_retry_after(make_client, rec
         )
     )
     client = make_client(rec)
-    with pytest.raises(AuthApiError) as ei:
+    with pytest.raises(AuthRateLimitError) as ei:
         await client.change_password("tok", "Old1!", "New2!")
     exc = ei.value
     assert exc.status_code == 429
@@ -205,6 +206,41 @@ async def test_email_provider_code_has_friendly_name(make_client, recorder):
     with pytest.raises(AuthConflictError) as ei:
         await client.add_email("tok", "new@example.com")
     assert ei.value.error_name == "EMAIL_IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.parametrize(
+    ("code", "name"),
+    [
+        ("EXT_8016", "OAUTH_STATE_REUSED"),
+        ("EXT_8105", "PATREON_CREATOR_API_RATE_LIMITED"),
+        ("EXT_8214", "BILLING_RATE_LIMITED"),
+    ],
+)
+async def test_current_external_provider_codes_have_friendly_names(
+    make_client,
+    recorder,
+    code,
+    name,
+):
+    rec = recorder(lambda r: httpx.Response(400, json=envelope(code)))
+    client = make_client(rec)
+
+    with pytest.raises(AuthBadRequestError) as ei:
+        await client.login("a", "b", project_hash="P")
+
+    assert ei.value.error_name == name
+
+
+async def test_unexpected_redirect_is_an_api_error(make_client, recorder):
+    rec = recorder(
+        lambda r: httpx.Response(307, headers={"Location": "https://elsewhere.invalid"})
+    )
+    client = make_client(rec)
+
+    with pytest.raises(AuthApiError) as ei:
+        await client.validate(token="tok")
+
+    assert ei.value.status_code == 307
 
 
 async def test_malformed_success_payload_preserves_validation_error(make_client, recorder):

@@ -172,6 +172,7 @@ class ValidateApiKeyResponse(ActionResponse):
 class BillingCatalogResponse(ActionResponse):
     """Per-project catalog listing (subscriptions + credit packages)."""
 
+    contract_version: int = 2
     project_hash: str | None = None
     billing_group_hash: str | None = None
     provider: str | None = None

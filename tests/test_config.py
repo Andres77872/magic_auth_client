@@ -17,6 +17,7 @@ def test_from_env_reads_all_names():
         "USER_GROUP_HASH": "UGH",
         "AUTH_FORWARD_USER_AGENT": "svc/2.0",
         "AUTH_FORWARD_TIMEOUT_SECONDS": "5.5",
+        "AUTH_VERIFY_TLS": "false",
     }
     cfg = MagicAuthConfig.from_env(env)
     assert cfg.base_url == "https://auth.example.com"  # trailing slash stripped
@@ -24,6 +25,7 @@ def test_from_env_reads_all_names():
     assert cfg.user_group_hash == "UGH"
     assert cfg.user_agent == "svc/2.0"
     assert cfg.timeout_seconds == 5.5
+    assert cfg.verify_tls is False
 
 
 def test_per_endpoint_override_beats_base_url():
@@ -50,6 +52,17 @@ def test_endpoints_without_override_use_base_url():
     assert cfg.check_availability_endpoint == "http://x/auth/check-availability"
     assert cfg.validate_api_key_endpoint == "http://x/auth/validate-api-key"
     assert cfg.profile_endpoint == "http://x/users/profile"
+    assert (
+        cfg.billing_catalog_endpoint("project/with spaces")
+        == "http://x/internal/projects/project%2Fwith%20spaces/billing/catalog"
+    )
+    assert cfg.user_email_endpoint("email/one") == "http://x/users/me/emails/email%2Fone"
+
+
+@pytest.mark.parametrize("value", ["not-a-bool", "enabled", "2"])
+def test_from_env_rejects_invalid_tls_boolean(value):
+    with pytest.raises(ValueError, match="AUTH_VERIFY_TLS"):
+        MagicAuthConfig.from_env({"AUTH_VERIFY_TLS": value})
 
 
 # Delegation config ------------------------------------------------------------

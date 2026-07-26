@@ -109,6 +109,14 @@ class AuthValidationError(AuthApiError):
     """HTTP 422 (FastAPI validation; e.g. missing User-Agent or form field)."""
 
 
+class AuthRateLimitError(AuthApiError):
+    """HTTP 429.
+
+    Inspect ``retry_after_seconds`` for a normalized delta when available and
+    ``retry_after`` for the provider's raw header value.
+    """
+
+
 class AuthServerError(AuthApiError):
     """HTTP 5xx."""
 
@@ -143,6 +151,7 @@ _STATUS_TO_EXC: dict[int, type[AuthApiError]] = {
     404: AuthNotFoundError,
     409: AuthConflictError,
     422: AuthValidationError,
+    429: AuthRateLimitError,
 }
 
 

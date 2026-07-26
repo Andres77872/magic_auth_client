@@ -119,6 +119,21 @@ async def test_platform_login_forwards_remember_me(make_client, recorder):
     assert resp.remember_me is True
 
 
+async def test_platform_login_forwards_request_context(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True}))
+    client = make_client(rec)
+
+    await client.platform_login(
+        "root",
+        "pw",
+        user_agent="browser/1",
+        client_ip="203.0.113.10",
+    )
+
+    assert rec.last.headers["user-agent"] == "browser/1"
+    assert rec.last.headers["x-forwarded-for"] == "203.0.113.10"
+
+
 async def test_register_uses_config_group_and_omits_none(make_client, recorder):
     rec = recorder(
         lambda r: httpx.Response(
@@ -180,6 +195,16 @@ async def test_validate_requires_a_credential(make_client, recorder):
     client = make_client(rec)
     with pytest.raises(ValueError):
         await client.validate()
+    assert rec.requests == []
+
+
+async def test_validate_rejects_ambiguous_token_transports(make_client, recorder):
+    rec = recorder(lambda r: httpx.Response(200, json={"success": True, "valid": True}))
+    client = make_client(rec)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await client.validate(token="bearer", session_token="cookie")
+
     assert rec.requests == []
 
 

@@ -10,10 +10,24 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 from . import constants
 
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _parse_bool(value: str | None, *, default: bool, name: str) -> bool:
+    """Parse a security-sensitive boolean without treating typos as ``False``."""
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    raise ValueError(f"{name} must be one of: 1/0, true/false, yes/no, on/off")
 
 
 def parse_trusted_clients(spec: str | None) -> dict[str, frozenset[str]]:
@@ -159,13 +173,19 @@ class MagicAuthConfig:
         return self._resolve(None, constants.PATH_USER_EMAILS)
 
     def user_email_endpoint(self, email_id: str) -> str:
-        return f"{self.user_emails_endpoint}/{email_id}"
+        return f"{self.user_emails_endpoint}/{quote(email_id, safe='')}"
 
     def user_email_resend_endpoint(self, email_id: str) -> str:
-        return f"{self.user_emails_endpoint}/{email_id}/resend"
+        return f"{self.user_email_endpoint(email_id)}/resend"
 
     def user_email_primary_endpoint(self, email_id: str) -> str:
-        return f"{self.user_emails_endpoint}/{email_id}/primary"
+        return f"{self.user_email_endpoint(email_id)}/primary"
+
+    def billing_catalog_endpoint(self, project_hash: str) -> str:
+        path = constants.PATH_BILLING_CATALOG.format(
+            project_hash=quote(project_hash, safe="")
+        )
+        return self._resolve(None, path)
 
     # Construction -------------------------------------------------------------
     @classmethod
@@ -179,6 +199,7 @@ class MagicAuthConfig:
         * ``base_url``: ``AUTH_SERVICE_BASE_URL`` else ``AUTH_API_URL``
         * ``user_agent``: ``AUTH_FORWARD_USER_AGENT`` else ``AUTH_PROVIDER_USER_AGENT``
         * ``timeout_seconds``: ``AUTH_FORWARD_TIMEOUT_SECONDS`` else ``AUTH_API_TIMEOUT``
+        * ``verify_tls``: ``AUTH_VERIFY_TLS`` (defaults to true)
         """
         e = env if env is not None else os.environ
         base_raw = e.get("AUTH_SERVICE_BASE_URL") or e.get("AUTH_API_URL") or constants.DEFAULT_BASE_URL
@@ -208,6 +229,11 @@ class MagicAuthConfig:
             user_group_hash=e.get("USER_GROUP_HASH"),
             user_agent=user_agent,
             timeout_seconds=float(timeout_raw),
+            verify_tls=_parse_bool(
+                e.get("AUTH_VERIFY_TLS"),
+                default=True,
+                name="AUTH_VERIFY_TLS",
+            ),
             delegation_enabled=delegation_enabled,
             delegation_trusted_clients=parse_trusted_clients(e.get("DELEGATED_AUTH_TRUSTED_CLIENTS")),
         )

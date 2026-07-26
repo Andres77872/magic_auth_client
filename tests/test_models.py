@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from magic_auth_client import ActionResponse, LoginResponse, ValidateSessionResponse
+from magic_auth_client import (
+    ActionResponse,
+    BillingCatalogResponse,
+    LoginResponse,
+    ValidateSessionResponse,
+)
 from magic_auth_client.models import TokenPair, _BaseResponse
 
 
@@ -57,3 +62,10 @@ def test_is_expired():
     assert TokenPair(expires_at=past).is_expired() is True
     assert TokenPair(expires_at=future).is_expired() is False
     assert TokenPair().is_expired() is None
+
+
+def test_billing_catalog_exposes_contract_version():
+    response = BillingCatalogResponse.model_validate(
+        {"success": True, "contract_version": 3, "project_hash": "project"}
+    )
+    assert response.contract_version == 3

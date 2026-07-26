@@ -9,12 +9,14 @@ from __future__ import annotations
 from .client import MagicAuthClient
 from .config import MagicAuthConfig, parse_trusted_clients
 from .constants import __version__
+from .cookies import RejectingCookieJar
 from .exceptions import (
     AuthApiError,
     AuthBadRequestError,
     AuthConflictError,
     AuthForbiddenError,
     AuthNotFoundError,
+    AuthRateLimitError,
     AuthServerError,
     AuthTransportError,
     AuthUnauthorizedError,
@@ -55,6 +57,7 @@ __all__ = [
     "MagicAuthClient",
     "MagicAuthConfig",
     "parse_trusted_clients",
+    "RejectingCookieJar",
     # models
     "ActionResponse",
     "ApiKeyInfo",
@@ -89,6 +92,7 @@ __all__ = [
     "AuthNotFoundError",
     "AuthConflictError",
     "AuthValidationError",
+    "AuthRateLimitError",
     "AuthServerError",
     "DelegationError",
     "parse_error_response",

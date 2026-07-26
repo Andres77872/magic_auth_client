@@ -5,5 +5,5 @@ from magic_auth_client.constants import DEFAULT_USER_AGENT
 
 
 def test_release_version_and_default_user_agent():
-    assert __version__ == "0.2.2"
-    assert DEFAULT_USER_AGENT == "magic_auth_client/0.2.2"
+    assert __version__ == "0.3.0"
+    assert DEFAULT_USER_AGENT == "magic_auth_client/0.3.0"

@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping
 
 from . import constants
 from .config import MagicAuthConfig
+from .cookies import RejectingCookieJar, isolate_provider_cookies
 from .exceptions import AuthTransportError, DelegationError, parse_error_response
 from .models import (
     ActionResponse,
@@ -38,38 +39,49 @@ from .models import (
 _M = TypeVar("_M", bound=BaseModel)
 
 
-def _ua_override(
-    user_agent: str | None,
+def _request_headers(
+    *,
+    bearer_token: str | None = None,
+    api_key: str | None = None,
+    user_agent: str | None = None,
     client_ip: str | None = None,
+    public_base_url: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, str] | None:
-    """Build a one-off ``User-Agent`` header override, or ``None`` to use the config
-    default. Used by the auth-forwarding methods so a reverse-proxy consumer can relay
-    the original caller's User-Agent to the provider."""
+    """Build optional credential and trusted request-context headers."""
+    if bearer_token and api_key:
+        raise ValueError("bearer_token and api_key are mutually exclusive")
+
     headers: dict[str, str] = {}
+    if bearer_token:
+        headers[constants.HEADER_AUTHORIZATION] = f"Bearer {bearer_token}"
+    if api_key:
+        headers[constants.HEADER_API_KEY] = api_key
     if user_agent:
         headers[constants.HEADER_USER_AGENT] = user_agent
     if client_ip:
         headers[constants.HEADER_FORWARDED_FOR] = client_ip
-    return headers or None
-
-
-def _link_overrides(
-    user_agent: str | None,
-    public_base_url: str | None,
-    idempotency_key: str | None = None,
-    client_ip: str | None = None,
-) -> dict[str, str] | None:
-    """Build optional headers for user-facing email-link requests."""
-    headers: dict[str, str] = {}
-    if user_agent:
-        headers[constants.HEADER_USER_AGENT] = user_agent
     if public_base_url:
         headers[constants.HEADER_PUBLIC_BASE_URL] = public_base_url
     if idempotency_key:
         headers[constants.HEADER_IDEMPOTENCY_KEY] = idempotency_key
-    if client_ip:
-        headers[constants.HEADER_FORWARDED_FOR] = client_ip
     return headers or None
+
+
+def _session_credential(
+    operation: str,
+    *,
+    token: str | None,
+    session_token: str | None,
+) -> tuple[str | None, dict[str, str] | None]:
+    """Require exactly one access-token transport and return request parts."""
+    if bool(token) == bool(session_token):
+        raise ValueError(
+            f"{operation} requires exactly one of token or session_token"
+        )
+    if token:
+        return token, None
+    return None, {constants.COOKIE_SESSION: str(session_token)}
 
 
 class MagicAuthClient:
@@ -77,7 +89,7 @@ class MagicAuthClient:
 
     The client either owns an internal ``httpx.AsyncClient`` (created when
     ``http_client`` is omitted and closed by :meth:`aclose`) or borrows one passed in
-    by the caller (never closed here) so a service can share a pooled client::
+    by the caller (never closed here) so a service can use a dedicated pooled client::
 
         async with MagicAuthClient(MagicAuthConfig.from_env()) as auth:
             login = await auth.login("alice", "pw", project_hash="ABC...")
@@ -91,12 +103,14 @@ class MagicAuthClient:
     ) -> None:
         self._config = config if config is not None else MagicAuthConfig.from_env()
         if http_client is not None:
+            isolate_provider_cookies(http_client)
             self._client = http_client
             self._owns_client = False
         else:
             self._client = httpx.AsyncClient(
                 timeout=self._config.timeout_seconds,
                 verify=self._config.verify_tls,
+                cookies=RejectingCookieJar(),
             )
             self._owns_client = True
 
@@ -138,7 +152,9 @@ class MagicAuthClient:
         # cookies= kwarg: these are per-call credentials that must not persist on a
         # shared/borrowed client (and httpx deprecates per-request cookies).
         if cookies:
-            req_headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
+            req_headers["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in cookies.items()
+            )
 
         form = None
         if data is not None:
@@ -155,7 +171,7 @@ class MagicAuthClient:
         except httpx.HTTPError as exc:
             raise AuthTransportError(cause=exc) from exc
 
-        if response.status_code >= 400:
+        if not response.is_success:
             raise parse_error_response(response)
 
         try:
@@ -203,11 +219,17 @@ class MagicAuthClient:
             self._config.login_endpoint,
             model=LoginResponse,
             data=data,
-            headers=_ua_override(user_agent, client_ip),
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
     async def platform_login(
-        self, username: str, password: str, *, remember_me: bool = False
+        self,
+        username: str,
+        password: str,
+        *,
+        remember_me: bool = False,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> LoginResponse:
         """Login for root/admin users without project scope (dashboard access)."""
         data: dict[str, Any] = {"username": username, "password": password}
@@ -218,6 +240,7 @@ class MagicAuthClient:
             self._config.platform_login_endpoint,
             model=LoginResponse,
             data=data,
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
     async def register(
@@ -248,11 +271,16 @@ class MagicAuthClient:
                 "email": email,
                 "user_group_hash": resolved,
             },
-            headers=_ua_override(user_agent, client_ip),
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
     async def validate(
-        self, *, token: str | None = None, session_token: str | None = None
+        self,
+        *,
+        token: str | None = None,
+        session_token: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> ValidateSessionResponse:
         """Validate an access token. Provide ``token`` (Bearer header) or
         ``session_token`` (cookie).
@@ -260,23 +288,30 @@ class MagicAuthClient:
         Note: the provider may return HTTP 200 with ``valid=False``; this method does
         not raise in that case — inspect ``.valid`` on the result.
         """
-        if not token and not session_token:
-            raise ValueError("validate requires token or session_token")
-        headers: dict[str, str] = {}
-        cookies: dict[str, str] | None = None
-        if token:
-            headers[constants.HEADER_AUTHORIZATION] = f"Bearer {token}"
-        else:
-            cookies = {constants.COOKIE_SESSION: session_token}  # type: ignore[dict-item]
+        bearer_token, cookies = _session_credential(
+            "validate",
+            token=token,
+            session_token=session_token,
+        )
         return await self._request(
             "GET",
             self._config.validate_endpoint,
             model=ValidateSessionResponse,
-            headers=headers,
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
             cookies=cookies,
         )
 
-    async def validate_api_key(self, api_key: str) -> ValidateApiKeyResponse:
+    async def validate_api_key(
+        self,
+        api_key: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> ValidateApiKeyResponse:
         """Validate an API key via the ``X-API-Key`` header.
 
         Never sends ``Authorization`` (the provider rejects requests carrying both
@@ -287,7 +322,11 @@ class MagicAuthClient:
             "POST",
             self._config.validate_api_key_endpoint,
             model=ValidateApiKeyResponse,
-            headers={constants.HEADER_API_KEY: api_key},
+            headers=_request_headers(
+                api_key=api_key,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     async def get_billing_catalog(
@@ -296,6 +335,8 @@ class MagicAuthClient:
         project_hash: str,
         bearer_token: str,
         provider: str = "stripe",
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> BillingCatalogResponse:
         """List a project's centralized billing catalog (subscriptions + credit packs).
 
@@ -303,13 +344,16 @@ class MagicAuthClient:
         is the billing S2S bearer (not a user session token). The catalog carries no
         secrets — only display info, opaque ``features``, and the price ``lookup_key``.
         """
-        url = f"{self._config.base_url.rstrip('/')}/internal/projects/{project_hash}/billing/catalog"
         return await self._request(
             "GET",
-            url,
+            self._config.billing_catalog_endpoint(project_hash),
             model=BillingCatalogResponse,
             params={"provider": provider},
-            headers={constants.HEADER_AUTHORIZATION: f"Bearer {bearer_token}"},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     async def logout(
@@ -322,23 +366,20 @@ class MagicAuthClient:
     ) -> LogoutResponse:
         """Invalidate the session and revoke its refresh family. ``user_agent``
         overrides the configured User-Agent for this call."""
-        if not token and not session_token:
-            raise ValueError("logout requires token or session_token")
-        headers: dict[str, str] = {}
-        cookies: dict[str, str] | None = None
-        if token:
-            headers[constants.HEADER_AUTHORIZATION] = f"Bearer {token}"
-        else:
-            cookies = {constants.COOKIE_SESSION: session_token}  # type: ignore[dict-item]
-        if user_agent:
-            headers[constants.HEADER_USER_AGENT] = user_agent
-        if client_ip:
-            headers[constants.HEADER_FORWARDED_FOR] = client_ip
+        bearer_token, cookies = _session_credential(
+            "logout",
+            token=token,
+            session_token=session_token,
+        )
         return await self._request(
             "POST",
             self._config.logout_endpoint,
             model=LogoutResponse,
-            headers=headers,
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
             cookies=cookies,
         )
 
@@ -362,18 +403,27 @@ class MagicAuthClient:
                 self._config.refresh_endpoint,
                 model=LoginResponse,
                 cookies={constants.COOKIE_REFRESH: refresh_token},
-                headers=_ua_override(user_agent, client_ip),
+                headers=_request_headers(
+                    user_agent=user_agent,
+                    client_ip=client_ip,
+                ),
             )
         return await self._request(
             "POST",
             self._config.refresh_endpoint,
             model=LoginResponse,
             data={"refresh_token": refresh_token},
-            headers=_ua_override(user_agent, client_ip),
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
     async def switch_project(
-        self, access_token: str, project_hash: str, *, refresh_token: str | None = None
+        self,
+        access_token: str,
+        project_hash: str,
+        *,
+        refresh_token: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> SwitchProjectResponse:
         """Switch the session to another accessible project, rotating tokens.
 
@@ -385,11 +435,20 @@ class MagicAuthClient:
             self._config.switch_project_endpoint,
             model=SwitchProjectResponse,
             data={"project_hash": project_hash, "refresh_token": refresh_token},
-            headers={constants.HEADER_AUTHORIZATION: f"Bearer {access_token}"},
+            headers=_request_headers(
+                bearer_token=access_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     async def check_availability(
-        self, *, username: str | None = None, email: str | None = None
+        self,
+        *,
+        username: str | None = None,
+        email: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> CheckAvailabilityResponse:
         """Check whether a username and/or email is available."""
         if not username and not email:
@@ -399,15 +458,26 @@ class MagicAuthClient:
             self._config.check_availability_endpoint,
             model=CheckAvailabilityResponse,
             data={"username": username, "email": email},
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
-    async def get_profile(self, token: str) -> UserProfileResponse:
+    async def get_profile(
+        self,
+        token: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> UserProfileResponse:
         """Fetch the current user's full profile (groups, projects, metadata)."""
         return await self._request(
             "GET",
             self._config.profile_endpoint,
             model=UserProfileResponse,
-            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     # Google OAuth (agnostic legs) ---------------------------------------------
@@ -419,6 +489,7 @@ class MagicAuthClient:
         return_origin: str,
         remember_me: bool = False,
         user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> str:
         """Begin the Google OAuth flow and return Google's authorization URL.
 
@@ -435,10 +506,12 @@ class MagicAuthClient:
         Raises :class:`AuthApiError` if the provider rejects the request (provider
         disabled, invalid/replayed provider-init, redirect/origin not allowed).
         """
-        req_headers = {
+        req_headers: dict[str, str] = {
             constants.HEADER_USER_AGENT: user_agent or self._config.user_agent,
             constants.HEADER_ACCEPT: "application/json",
         }
+        if client_ip:
+            req_headers[constants.HEADER_FORWARDED_FOR] = client_ip
         body = {
             "provider_init_token": provider_init_token,
             "redirect_uri": redirect_uri,
@@ -475,6 +548,7 @@ class MagicAuthClient:
         state: str,
         *,
         user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> LoginResponse:
         """Complete the Google OAuth callback and return the issued session.
 
@@ -494,7 +568,7 @@ class MagicAuthClient:
             self._config.google_oauth_callback_endpoint,
             model=LoginResponse,
             params={"code": code, "state": state},
-            headers=_ua_override(user_agent),
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
     # Password workflows -------------------------------------------------------
@@ -522,11 +596,11 @@ class MagicAuthClient:
             self._config.password_forgot_endpoint,
             model=ActionResponse,
             data={"email_or_username": email_or_username},
-            headers=_link_overrides(
-                user_agent,
-                public_base_url,
-                idempotency_key,
-                client_ip,
+            headers=_request_headers(
+                user_agent=user_agent,
+                public_base_url=public_base_url,
+                idempotency_key=idempotency_key,
+                client_ip=client_ip,
             ),
         )
 
@@ -551,7 +625,7 @@ class MagicAuthClient:
             self._config.password_reset_endpoint,
             model=ActionResponse,
             data={"token": token, "new_password": new_password},
-            headers=_ua_override(user_agent, client_ip),
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
     async def change_password(
@@ -571,17 +645,16 @@ class MagicAuthClient:
         user's *other* sessions but preserves this one, and issues no new token.
         ``user_agent`` overrides the configured User-Agent for this call.
         """
-        headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
-        if user_agent:
-            headers[constants.HEADER_USER_AGENT] = user_agent
-        if client_ip:
-            headers[constants.HEADER_FORWARDED_FOR] = client_ip
         return await self._request(
             "POST",
             self._config.password_change_endpoint,
             model=ChangePasswordResponse,
             data={"current_password": current_password, "new_password": new_password},
-            headers=headers,
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     # Email workflows ----------------------------------------------------------
@@ -604,16 +677,26 @@ class MagicAuthClient:
             self._config.email_verify_endpoint,
             model=ActionResponse,
             data={"token": token},
-            headers=_ua_override(user_agent, client_ip),
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
-    async def list_emails(self, token: str) -> EmailListResponse:
+    async def list_emails(
+        self,
+        token: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> EmailListResponse:
         """List the authenticated user's email addresses (Bearer ``token``)."""
         return await self._request(
             "GET",
             self._config.user_emails_endpoint,
             model=EmailListResponse,
-            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     async def add_email(
@@ -634,16 +717,18 @@ class MagicAuthClient:
         activation link points there (the provider validates it against its
         allowlist). ``idempotency_key`` is forwarded as ``Idempotency-Key``.
         """
-        headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
-        headers.update(
-            _link_overrides(user_agent, public_base_url, idempotency_key, client_ip) or {}
-        )
         return await self._request(
             "POST",
             self._config.user_emails_endpoint,
             model=ActionResponse,
             data={"email": email},
-            headers=headers,
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                public_base_url=public_base_url,
+                idempotency_key=idempotency_key,
+                client_ip=client_ip,
+            ),
         )
 
     async def resend_email_activation(
@@ -664,18 +749,27 @@ class MagicAuthClient:
         activation link points there (the provider validates it against its
         allowlist). ``idempotency_key`` is forwarded as ``Idempotency-Key``.
         """
-        headers = {constants.HEADER_AUTHORIZATION: f"Bearer {token}"}
-        headers.update(
-            _link_overrides(user_agent, public_base_url, idempotency_key, client_ip) or {}
-        )
         return await self._request(
             "POST",
             self._config.user_email_resend_endpoint(email_id),
             model=ActionResponse,
-            headers=headers,
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                public_base_url=public_base_url,
+                idempotency_key=idempotency_key,
+                client_ip=client_ip,
+            ),
         )
 
-    async def remove_email(self, token: str, email_id: str) -> RemoveEmailResponse:
+    async def remove_email(
+        self,
+        token: str,
+        email_id: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> RemoveEmailResponse:
         """Remove one of the user's email addresses (Bearer ``token``).
 
         If the removed address was primary, the provider promotes the next
@@ -685,18 +779,31 @@ class MagicAuthClient:
             "DELETE",
             self._config.user_email_endpoint(email_id),
             model=RemoveEmailResponse,
-            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     async def set_primary_email(
-        self, token: str, email_id: str
+        self,
+        token: str,
+        email_id: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> SetPrimaryEmailResponse:
         """Mark an activated email as the user's primary address (Bearer ``token``)."""
         return await self._request(
             "POST",
             self._config.user_email_primary_endpoint(email_id),
             model=SetPrimaryEmailResponse,
-            headers={constants.HEADER_AUTHORIZATION: f"Bearer {token}"},
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
         )
 
     # Delegated / service-to-service auth --------------------------------------
@@ -708,6 +815,8 @@ class MagicAuthClient:
         target_project_hash: str | None = None,
         trusted_clients: Mapping[str, Iterable[str]] | None = None,
         enabled: bool | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
     ) -> DelegatedSession:
         """Resolve a delegated (service-to-service) session.
 
@@ -750,7 +859,11 @@ class MagicAuthClient:
             )
 
         # 1) Validate the delegation API key (short-circuits before touching the session).
-        api_key_resp = await self.validate_api_key(delegation_api_key)
+        api_key_resp = await self.validate_api_key(
+            delegation_api_key,
+            user_agent=user_agent,
+            client_ip=client_ip,
+        )
         if not api_key_resp.valid:
             raise DelegationError("delegation_key_invalid", status_code=401, message="Invalid delegation API key")
 
@@ -770,7 +883,11 @@ class MagicAuthClient:
             )
 
         # 2) Validate the subject's session.
-        session_resp = await self.validate(token=session_token)
+        session_resp = await self.validate(
+            token=session_token,
+            user_agent=user_agent,
+            client_ip=client_ip,
+        )
         if not session_resp.valid:
             raise DelegationError("delegated_subject_invalid", status_code=401, message="Invalid subject session")
 

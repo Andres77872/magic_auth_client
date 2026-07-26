@@ -6,19 +6,24 @@ models, and a typed exception hierarchy — so consuming services don't reimplem
 auth plumbing.
 
 - **Async-first** (`httpx.AsyncClient`).
+- **Typed package** (Pydantic v2 models plus a PEP 561 `py.typed` marker).
 - **Scope:** the auth-consumer core (login, register, validate, refresh, logout,
   switch-project, API-key validation, profile). Not a full admin SDK.
 - **Framework-agnostic:** no FastAPI dependency. Wire your own request handling.
+- **Backend-safe cookie handling:** provider `Set-Cookie` credentials are never
+  retained in the process-wide HTTP client.
 
 ## Install
 
 ```bash
-pip install git+https://<host>/magic_auth_client
+pip install "magic-auth-client @ git+https://<host>/magic_auth_client.git@<release-sha>"
 # or, for local development:
 pip install -e ".[dev]"
 ```
 
 Requires Python ≥ 3.10. Depends only on `httpx` and `pydantic` v2.
+Production consumers should pin a release tag or immutable commit SHA; keep sibling
+editable installs only in development requirements.
 
 ## Quickstart
 
@@ -57,6 +62,7 @@ asyncio.run(main())
 | `USER_GROUP_HASH` | Default `user_group_hash` for `register()` | `None` |
 | `AUTH_FORWARD_USER_AGENT` | `User-Agent` sent on every request | `magic_auth_client/<version>` |
 | `AUTH_FORWARD_TIMEOUT_SECONDS` | Request timeout (owned client only) | `10` |
+| `AUTH_VERIFY_TLS` | Verify provider TLS certificates (owned client only) | `true` |
 | `DELEGATED_AUTH_ENABLED` | Enable delegated auth (`validate_delegated_session`) | `false` |
 | `DELEGATED_AUTH_TRUSTED_CLIENTS` | Trust map (see [Delegated auth](#delegated-auth)) | `{}` |
 
@@ -72,20 +78,26 @@ single `MagicAuthConfig.from_env()` is a drop-in for both `api.magic_llm` and
 
 ## Connection pooling
 
-Pass your own `httpx.AsyncClient` to reuse a connection pool across requests. The
-client **borrows** it and will not close it on `aclose()`:
+Pass a dedicated `httpx.AsyncClient` to reuse a connection pool across auth requests.
+The client **borrows** it and will not close it on `aclose()`. `api.auth` emits
+browser-oriented access/refresh cookies, but a backend pool serves many users; the
+library therefore replaces an empty borrowed cookie jar with `RejectingCookieJar`.
+A borrowed client with preloaded cookies or default `Authorization`, `X-API-Key`, or
+`Cookie` headers is rejected:
 
 ```python
 import httpx
-from magic_auth_client import MagicAuthClient, MagicAuthConfig
+from magic_auth_client import MagicAuthClient, MagicAuthConfig, RejectingCookieJar
 
-shared = httpx.AsyncClient(timeout=10.0)
+shared = httpx.AsyncClient(timeout=10.0, cookies=RejectingCookieJar())
 auth = MagicAuthClient(MagicAuthConfig.from_env(), http_client=shared)
 # ... reuse across many requests; close `shared` at app shutdown.
 ```
 
 When no client is passed, `MagicAuthClient` creates and owns one (closed by `aclose()`
-/ `async with`).
+/ `async with`) with the same reject-all cookie behavior. Explicit per-call cookie
+transports such as `validate(session_token=...)` and `refresh(..., use_cookie=True)`
+still work; only response-cookie persistence is disabled.
 
 ## API
 
@@ -98,6 +110,7 @@ All methods are `async` and return a typed pydantic model.
 | `register(username, password, *, email=None, user_group_hash=None)` | `POST /auth/register` | `user_group_hash` required (or config default) |
 | `validate(*, token=None, session_token=None)` | `GET /auth/validate` | Bearer or `session_token` cookie; 200/`valid=False` not raised |
 | `validate_api_key(api_key)` | `POST /auth/validate-api-key` | `X-API-Key` only; never sends `Authorization` |
+| `get_billing_catalog(*, project_hash, bearer_token, provider="stripe")` | `GET /internal/projects/{hash}/billing/catalog` | dedicated billing S2S Bearer; consumer-safe catalog |
 | `logout(*, token=None, session_token=None)` | `POST /auth/logout` | |
 | `refresh(refresh_token, *, use_cookie=False)` | `POST /auth/refresh` | form/cookie, never Bearer |
 | `switch_project(access_token, project_hash, *, refresh_token=None)` | `POST /auth/switch-project` | Bearer header + form body |
@@ -129,6 +142,7 @@ Consumer-facing auth methods also accept an optional `client_ip`. It is forwarde
 `X-Forwarded-For` so a trusted BFF can preserve end-user rate-limit attribution. Only
 pass an address derived from the server-observed peer after applying the deployment's
 trusted-proxy policy; never copy a browser-supplied forwarding header into this field.
+They also accept a per-call `user_agent` override where request attribution is useful.
 
 **Google sign-in** exposes only the two *agnostic* legs (`start_google_oauth` / `complete_google_oauth`). The project-specific concerns — minting the opaque `provider_init_token`, the browser entry/return, the one-time delivery code, and the session cookie — belong to the consuming BFF, not this client. `start_google_oauth` does **not** follow the `303`; it returns Google's authorization URL for the BFF to hand to the browser. `complete_google_oauth` is a server-to-server call (no browser cookies) and returns the same `LoginResponse` as password login, including the refresh token.
 
@@ -196,6 +210,7 @@ MagicAuthError
     ├── AuthNotFoundError        # 404
     ├── AuthConflictError        # 409
     ├── AuthValidationError      # 422
+    ├── AuthRateLimitError       # 429
     └── AuthServerError          # 5xx
 ```
 
@@ -234,6 +249,22 @@ consumer because they are stateful and deployment-specific (both `api.magic_llm`
 - **Circuit breaker / retries** — wrap calls or inject a configured `httpx.AsyncClient`.
 - **Transport** — e.g. WebSocket subprotocol token extraction; pass the extracted token
   string to `validate(token=...)`.
+
+### Recommended consumer boundary
+
+The shared client owns provider-stable behavior: endpoint resolution, form/JSON
+encoding, credential placement, provider-cookie isolation, response parsing, and the
+provider error vocabulary. Each consuming project should keep deployment/application
+policy in its own adapter:
+
+- browser refresh-cookie attributes and CSRF checks;
+- expected-project enforcement and local user provisioning;
+- validation caches, retries/circuit breakers, and refresh single-flight;
+- mapping provider exceptions/models into that project's public HTTP contract.
+
+This is the split used by `magic-worlds-api`, `api.findit.moe`, and `api.magic_llm`;
+their existing reject-all cookie-jar implementations can be replaced by the exported
+`RejectingCookieJar` or omitted when they pass an otherwise empty dedicated client.
 
 ## Testing
 
