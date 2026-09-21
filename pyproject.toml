@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "magic-auth-client"
-version = "0.3.0"
+# Single source of truth: src/magic_auth_client/constants.py::__version__,
+# which scripts/bump_version.py increments on every push to master.
+dynamic = ["version"]
 description = "Async client for the magic auth provider (api.auth)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +23,9 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]
+
+[tool.hatch.version]
+path = "src/magic_auth_client/constants.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magic_auth_client"]

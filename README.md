@@ -16,7 +16,7 @@ auth plumbing.
 ## Install
 
 ```bash
-pip install "magic-auth-client @ git+https://<host>/magic_auth_client.git@<release-sha>"
+pip install "magic-auth-client @ git+https://github.com/Andres77872/magic_auth_client.git@master"
 # or, for local development:
 pip install -e ".[dev]"
 ```
