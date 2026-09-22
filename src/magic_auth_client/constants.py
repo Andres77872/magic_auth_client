@@ -8,7 +8,7 @@ semantic names. ``ERROR_CODE_NAMES`` lets callers branch on the friendly name in
 
 from __future__ import annotations
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 # Defaults ---------------------------------------------------------------------
 DEFAULT_BASE_URL = "http://localhost:8005"
@@ -27,16 +27,46 @@ PATH_SWITCH_PROJECT = "/auth/switch-project"
 PATH_CHECK_AVAILABILITY = "/auth/check-availability"
 PATH_PROFILE = "/users/profile"
 # Google OAuth (agnostic legs only — the BFF owns provider-init + the browser return) -
+# Deprecated aliases onto the provider-agnostic pipeline below; kept working by the
+# provider for at least one consumer release cycle.
 PATH_GOOGLE_OAUTH_START = "/auth/google/start"
 PATH_GOOGLE_OAUTH_CALLBACK = "/auth/google/callback"
+# Provider-agnostic OAuth (any connection key: google, microsoft, …) ----------------
+# Inverted handshake: the project's backend authenticates to ``/auth/oauth/init`` with
+# its project-scoped API key and receives an init token. The provider derives project,
+# binding and provisioning group from that credential — they are never sent on the wire
+# and the provider never calls back into the consumer.
+PATH_OAUTH_INIT = "/auth/oauth/init"
+PATH_OAUTH_START = "/auth/oauth/start"
+PATH_OAUTH_CALLBACK = "/auth/oauth/callback"
+PATH_OAUTH_PROVIDERS = "/auth/oauth/providers"
 # Password & email workflows (no env overrides; resolved against base_url) ----------
 PATH_PASSWORD_FORGOT = "/auth/password/forgot"
 PATH_PASSWORD_RESET = "/auth/password/reset"
 PATH_PASSWORD_CHANGE = "/auth/password/change"
 PATH_EMAIL_VERIFY = "/auth/email/verify"
 PATH_USER_EMAILS = "/users/me/emails"
-# Internal, consumer-safe billing surface --------------------------------------
+# Patreon entitlement link (current user's Bearer; Patreon is never a login provider) -
+PATH_PATREON_LINK = "/auth/patreon/link"
+PATH_PATREON_LINK_REQUEST = "/auth/patreon/link/request"
+PATH_PATREON_LINK_CONFIRM = "/auth/patreon/link/confirm"
+PATH_PATREON_LINK_STATUS = "/auth/patreon/link/status"
+# Internal, consumer-safe billing surface (billing S2S bearer) ------------------
 PATH_BILLING_CATALOG = "/internal/projects/{project_hash}/billing/catalog"
+PATH_BILLING_STATUS = "/internal/users/{user_hash}/billing"
+PATH_BILLING_CHECKOUT = "/internal/users/{user_hash}/billing/checkout"
+PATH_BILLING_PORTAL = "/internal/users/{user_hash}/billing/portal"
+PATH_BILLING_PURCHASE = "/internal/users/{user_hash}/billing/purchases/{purchase_ref}"
+PATH_BILLING_RESYNC = "/internal/users/{user_hash}/billing/resync"
+# Internal Patreon entitlement surface (Patreon S2S bearer) ---------------------
+PATH_PATREON_ENTITLEMENT = "/internal/users/{user_hash}/entitlements"
+PATH_PATREON_ENTITLEMENT_RESYNC = "/internal/users/{user_hash}/entitlements/patreon/resync"
+# Internal transactional email surface (root user's Bearer) ---------------------
+PATH_INTERNAL_EMAIL_RESOLVE_IDENTITY = "/internal/email/resolve-identity"
+PATH_INTERNAL_EMAIL_SEND_TEMPLATE = "/internal/email/send-template"
+PATH_INTERNAL_EMAIL_MESSAGE_STATUS = "/internal/email/message-status"
+# Public liveness probe (no credential) -----------------------------------------
+PATH_PING = "/system/ping"
 
 # Header / cookie names --------------------------------------------------------
 HEADER_AUTHORIZATION = "Authorization"
@@ -77,6 +107,7 @@ ERROR_CODE_NAMES: dict[str, str] = {
     "AUTH_1019": "TOKEN_EXPIRED",
     "AUTH_1020": "SESSION_REVOKED",
     "AUTH_1021": "JWT_CONFIGURATION_FAILURE",
+    "AUTH_1022": "REFRESH_TOKEN_REPLAYED",
     # Authorization (2xxx)
     "AUTHZ_2001": "ACCESS_DENIED",
     "AUTHZ_2002": "INSUFFICIENT_PERMISSIONS",
@@ -157,6 +188,11 @@ ERROR_CODE_NAMES: dict[str, str] = {
     "EXT_8028": "EXTERNAL_IDENTITY_NOT_LINKED",
     "EXT_8029": "OAUTH_PASSWORD_REQUIRED_FOR_UNLINK",
     "EXT_8030": "OAUTH_RATE_LIMITED",
+    # The user cancelled at the provider's consent screen (HTTP 400) — not a failure.
+    "EXT_8031": "OAUTH_USER_CANCELLED",
+    # A local account already owns this e-mail: the user must sign in with their
+    # existing method and link the provider from their account (HTTP 409).
+    "EXT_8032": "OAUTH_ACCOUNT_LINK_REQUIRED",
     # Patreon
     "EXT_8100": "PATREON_PROVIDER_NOT_CONFIGURED",
     "EXT_8101": "PATREON_PROVIDER_DISABLED",

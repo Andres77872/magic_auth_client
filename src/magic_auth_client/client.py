@@ -21,19 +21,36 @@ from .exceptions import AuthTransportError, DelegationError, parse_error_respons
 from .models import (
     ActionResponse,
     BillingCatalogResponse,
+    BillingCheckoutResponse,
+    BillingPortalResponse,
+    BillingPurchaseResponse,
+    BillingResyncResponse,
+    BillingStatusResponse,
     ChangePasswordResponse,
     CheckAvailabilityResponse,
     DelegatedSession,
+    EmailIdentityResponse,
     EmailListResponse,
+    EmailMessageStatusResponse,
     LoginResponse,
     LogoutResponse,
+    OAuthInitResponse,
+    OAuthProvidersResponse,
+    PatreonEntitlementResponse,
+    PatreonLinkRequestResponse,
+    PatreonLinkStatusResponse,
+    PatreonResyncResponse,
+    PatreonUnlinkResponse,
+    PingResponse,
     RegisterResponse,
     RemoveEmailResponse,
     SetPrimaryEmailResponse,
     SwitchProjectResponse,
+    TemplateEmailResponse,
     UserProfileResponse,
     ValidateApiKeyResponse,
     ValidateSessionResponse,
+    _HttpStatusMixin,
 )
 
 _M = TypeVar("_M", bound=BaseModel)
@@ -138,10 +155,17 @@ class MagicAuthClient:
         *,
         model: type[_M],
         data: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
     ) -> _M:
+        """Send one provider request and parse the 2xx body into ``model``.
+
+        ``data`` is form-encoded (the provider's auth endpoints); ``json`` is sent as a
+        JSON body (the internal S2S and Patreon endpoints, whose request models reject
+        form bodies). ``None`` values are dropped from both and from ``params``.
+        """
         req_headers: dict[str, str] = {
             constants.HEADER_USER_AGENT: self._config.user_agent,
             constants.HEADER_ACCEPT: "application/json",
@@ -159,14 +183,24 @@ class MagicAuthClient:
         form = None
         if data is not None:
             form = {key: value for key, value in data.items() if value is not None}
+        query = None
+        if params is not None:
+            # ``or None``: an empty mapping would make httpx strip the URL's own query.
+            query = {key: value for key, value in params.items() if value is not None} or None
+        # ``json`` is passed only when used, so form/GET calls keep the exact call
+        # shape consumers' transport doubles were written against.
+        extra: dict[str, Any] = {}
+        if json is not None:
+            extra["json"] = {key: value for key, value in json.items() if value is not None}
 
         try:
             response = await self._client.request(
                 method,
                 url,
                 data=form,
-                params=params,
+                params=query,
                 headers=req_headers,
+                **extra,
             )
         except httpx.HTTPError as exc:
             raise AuthTransportError(cause=exc) from exc
@@ -185,7 +219,10 @@ class MagicAuthClient:
         # with the wrong endpoint schema raises Pydantic's ValidationError.
         # Existing consumers use that distinction to fail closed without
         # treating a malformed 200 as provider unavailability.
-        return model.model_validate(payload)
+        parsed = model.model_validate(payload)
+        if isinstance(parsed, _HttpStatusMixin):
+            parsed._http_status = response.status_code
+        return parsed
 
     # Authentication flows -----------------------------------------------------
     async def login(
@@ -335,6 +372,7 @@ class MagicAuthClient:
         project_hash: str,
         bearer_token: str,
         provider: str = "stripe",
+        item_type: str | None = None,
         user_agent: str | None = None,
         client_ip: str | None = None,
     ) -> BillingCatalogResponse:
@@ -343,12 +381,237 @@ class MagicAuthClient:
         This is a server-to-server read on the internal billing surface; ``bearer_token``
         is the billing S2S bearer (not a user session token). The catalog carries no
         secrets — only display info, opaque ``features``, and the price ``lookup_key``.
+        ``item_type`` narrows the listing to ``subscription_plan`` or ``credit_package``.
         """
         return await self._request(
             "GET",
             self._config.billing_catalog_endpoint(project_hash),
             model=BillingCatalogResponse,
-            params={"provider": provider},
+            params={"provider": provider, "item_type": item_type},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def get_billing_status(
+        self,
+        user_hash: str,
+        *,
+        project_hash: str,
+        bearer_token: str,
+        provider: str = "stripe",
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> BillingStatusResponse:
+        """Read a user's safe billing facts (subscription state + one-time purchases).
+
+        Server-to-server: ``bearer_token`` is the billing S2S bearer. The provider
+        resolves ``project_hash`` to its billing group; a user with no billing history
+        comes back as ``status="free"`` rather than an error.
+        """
+        return await self._request(
+            "GET",
+            self._config.billing_status_endpoint(user_hash),
+            model=BillingStatusResponse,
+            params={"project_hash": project_hash, "provider": provider},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def get_billing_purchase(
+        self,
+        user_hash: str,
+        purchase_ref: str,
+        *,
+        project_hash: str,
+        bearer_token: str,
+        provider: str = "stripe",
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> BillingPurchaseResponse:
+        """Read one purchase's safe facts by its opaque ``purchase_ref`` (S2S bearer).
+
+        An unknown reference raises :class:`AuthNotFoundError`.
+        """
+        return await self._request(
+            "GET",
+            self._config.billing_purchase_endpoint(user_hash, purchase_ref),
+            model=BillingPurchaseResponse,
+            params={"project_hash": project_hash, "provider": provider},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def create_billing_checkout(
+        self,
+        user_hash: str,
+        *,
+        bearer_token: str,
+        project_hash: str,
+        intent_type: str,
+        price_ref: Mapping[str, str],
+        success_url: str,
+        cancel_url: str,
+        quantity: int = 1,
+        plan_code: str | None = None,
+        tier_code: str | None = None,
+        tier_name: str | None = None,
+        credit_product_code: str | None = None,
+        client_intent_ref: str | None = None,
+        provider: str = "stripe",
+        idempotency_key: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> BillingCheckoutResponse:
+        """Create a hosted Checkout session for a subscription or a credit purchase.
+
+        Server-to-server (billing S2S bearer). ``intent_type`` is ``"subscription"`` or
+        ``"credit_purchase"``; ``price_ref`` is ``{"ref_type": "lookup_key" | "price_id",
+        "value": ...}`` — use the catalog item's ``provider_price_lookup_key``.
+        ``idempotency_key`` is forwarded as ``Idempotency-Key``; replaying the same key
+        and body returns the original session with ``http_status == 200`` instead of
+        202, while the same key with a different body raises :class:`AuthConflictError`.
+        """
+        return await self._request(
+            "POST",
+            self._config.billing_checkout_endpoint(user_hash),
+            model=BillingCheckoutResponse,
+            json={
+                "project_hash": project_hash,
+                "provider": provider,
+                "intent_type": intent_type,
+                "price_ref": dict(price_ref),
+                "quantity": quantity,
+                "plan_code": plan_code,
+                "tier_code": tier_code,
+                "tier_name": tier_name,
+                "credit_product_code": credit_product_code,
+                "success_url": success_url,
+                "cancel_url": cancel_url,
+                "client_intent_ref": client_intent_ref,
+            },
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+    async def create_billing_portal(
+        self,
+        user_hash: str,
+        *,
+        bearer_token: str,
+        project_hash: str,
+        return_url: str,
+        provider: str = "stripe",
+        idempotency_key: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> BillingPortalResponse:
+        """Create a hosted, restricted customer-portal session (billing S2S bearer).
+
+        ``return_url`` is validated against the provider's allowlist. A user with no
+        billing customer raises an :class:`AuthApiError`.
+        """
+        return await self._request(
+            "POST",
+            self._config.billing_portal_endpoint(user_hash),
+            model=BillingPortalResponse,
+            json={
+                "project_hash": project_hash,
+                "provider": provider,
+                "return_url": return_url,
+            },
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+    async def request_billing_resync(
+        self,
+        user_hash: str,
+        *,
+        bearer_token: str,
+        project_hash: str,
+        reason: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> BillingResyncResponse:
+        """Ask the provider to re-read a user's billing state (billing S2S bearer).
+
+        Always answers 202: inspect ``accepted``/``status`` — the provider reports
+        ``disabled``, ``rate_limited`` or ``degraded`` in the body rather than failing.
+        """
+        return await self._request(
+            "POST",
+            self._config.billing_resync_endpoint(user_hash),
+            model=BillingResyncResponse,
+            json={"project_hash": project_hash, "reason": reason},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    # Patreon entitlements (server-to-server) ----------------------------------
+    async def get_patreon_entitlement(
+        self,
+        user_hash: str,
+        *,
+        bearer_token: str,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> PatreonEntitlementResponse:
+        """Read a user's normalized Patreon entitlement (Patreon S2S bearer).
+
+        The entitlement is scoped to the user, not to a project. A user with no Patreon
+        link comes back as a ``status="free"`` entitlement rather than an error.
+        """
+        return await self._request(
+            "GET",
+            self._config.patreon_entitlement_endpoint(user_hash),
+            model=PatreonEntitlementResponse,
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def request_patreon_resync(
+        self,
+        user_hash: str,
+        *,
+        bearer_token: str,
+        force: bool = False,
+        reason: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> PatreonResyncResponse:
+        """Ask the provider to re-read a user's Patreon membership (Patreon S2S bearer).
+
+        Always answers 202: inspect ``accepted``/``status`` for ``disabled``,
+        ``rate_limited`` or ``degraded`` outcomes.
+        """
+        return await self._request(
+            "POST",
+            self._config.patreon_entitlement_resync_endpoint(user_hash),
+            model=PatreonResyncResponse,
+            json={"force": force, "reason": reason},
             headers=_request_headers(
                 bearer_token=bearer_token,
                 user_agent=user_agent,
@@ -568,6 +831,176 @@ class MagicAuthClient:
             self._config.google_oauth_callback_endpoint,
             model=LoginResponse,
             params={"code": code, "state": state},
+            headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
+        )
+
+    # Provider-agnostic OAuth (any connection key) ------------------------------
+    def _require_project_api_key(self, operation: str, override: str | None) -> str:
+        """Resolve the project-scoped API key without ever putting it in a message."""
+        api_key = override if override is not None else self._config.project_api_key
+        if not api_key:
+            raise ValueError(
+                f"{operation} requires a project-scoped API key "
+                "(config.project_api_key or the project_api_key argument)"
+            )
+        return api_key
+
+    async def oauth_init(
+        self,
+        connection: str,
+        *,
+        return_origin: str,
+        remember_me: bool = False,
+        purpose: str = "login",
+        project_api_key: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> OAuthInitResponse:
+        """Mint a single-use init token for ``connection`` (inverted handshake).
+
+        POSTs to ``/auth/oauth/init`` authenticated with the project-scoped API key
+        (``X-API-Key``). The provider derives the project from that credential and the
+        provisioning group from the binding, so a caller MUST NOT send ``project_hash``
+        or ``user_group_hash`` — the provider rejects bodies that carry them. The
+        returned ``init_token`` is handed straight to :meth:`oauth_start`; it is the
+        replacement for the consumer-minted provider-init token, and no callback into
+        the consumer takes place.
+
+        Raises :class:`AuthApiError` if the credential is rejected, the binding is
+        missing/disabled, or ``return_origin`` is not on the binding's allow-list.
+        """
+        api_key = self._require_project_api_key("oauth_init", project_api_key)
+        return await self._request(
+            "POST",
+            self._config.oauth_init_endpoint,
+            model=OAuthInitResponse,
+            json={
+                "connection": connection,
+                "purpose": purpose,
+                "return_origin": return_origin,
+                "remember_me": remember_me,
+            },
+            headers=_request_headers(
+                api_key=api_key,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def list_oauth_providers(
+        self,
+        *,
+        project_api_key: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> OAuthProvidersResponse:
+        """Enabled sign-in providers for the calling project, so a login page renders
+        its buttons from data instead of a compiled-in provider list.
+
+        GETs ``/auth/oauth/providers`` with the project-scoped API key. Enabling a
+        provider becomes an administrative action in the provider with no front-end
+        release.
+        """
+        api_key = self._require_project_api_key("list_oauth_providers", project_api_key)
+        return await self._request(
+            "GET",
+            self._config.oauth_providers_endpoint,
+            model=OAuthProvidersResponse,
+            headers=_request_headers(
+                api_key=api_key,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def oauth_start(
+        self,
+        init_token: str,
+        redirect_uri: str,
+        *,
+        remember_me: bool | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> str:
+        """Begin the flow for the connection bound to ``init_token`` and return the
+        provider's authorization URL.
+
+        POSTs ``/auth/oauth/start``. The connection, project, provisioning group and
+        return origin all come from the init token, so this body carries nothing the
+        browser could influence beyond the ``redirect_uri``, which the provider
+        validates against the binding's allow-list. Like :meth:`start_google_oauth`,
+        the ``303`` is NOT followed — the ``Location`` is returned for the BFF to hand
+        to the browser as a top-level navigation.
+
+        ``remember_me`` is the one exception: it is a user preference rather than
+        security scope, so the provider lets the start request override the value
+        bound at init. It is sent only when it is not ``None``, and only a real JSON
+        boolean overrides — omitting it leaves the init-time value in place.
+
+        Raises :class:`AuthApiError` if the provider rejects the request (init token
+        invalid/replayed, binding disabled, redirect URI not allowed).
+        """
+        req_headers: dict[str, str] = {
+            constants.HEADER_USER_AGENT: user_agent or self._config.user_agent,
+            constants.HEADER_ACCEPT: "application/json",
+        }
+        if client_ip:
+            req_headers[constants.HEADER_FORWARDED_FOR] = client_ip
+        body: dict[str, Any] = {"init_token": init_token, "redirect_uri": redirect_uri}
+        if remember_me is not None:
+            # ``False`` is a meaningful override, so this is an explicit None check.
+            body["remember_me"] = bool(remember_me)
+        try:
+            response = await self._client.request(
+                "POST",
+                self._config.oauth_start_endpoint,
+                json=body,
+                headers=req_headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise AuthTransportError(cause=exc) from exc
+
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise AuthTransportError(
+                    "OAuth start returned a redirect without a Location header"
+                )
+            return location
+        if response.status_code >= 400:
+            raise parse_error_response(response)
+        raise AuthTransportError(
+            f"OAuth start expected a redirect, got HTTP {response.status_code}"
+        )
+
+    async def oauth_callback(
+        self,
+        code: str,
+        state: str,
+        *,
+        iss: str | None = None,
+        error: str | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> LoginResponse:
+        """Complete the provider-agnostic callback and return the issued session.
+
+        GETs ``/auth/oauth/callback``. The connection is read from the one-time state
+        record, never from this call. ``iss`` is forwarded when the identity provider
+        supplied it (issuer confirmation), and ``error`` when the provider reported one
+        instead of a code, which the provider maps to a neutral error code
+        (``EXT_8031`` for a user cancellation) rather than a session.
+
+        Raises :class:`AuthApiError` on any OAuth failure. Two codes deserve their own
+        message in a UI: ``EXT_8031`` (cancelled at the provider) and ``EXT_8032`` (an
+        existing local account owns this e-mail — sign in and link).
+        """
+        return await self._request(
+            "GET",
+            self._config.oauth_callback_endpoint,
+            model=LoginResponse,
+            params={"code": code, "state": state, "iss": iss, "error": error},
             headers=_request_headers(user_agent=user_agent, client_ip=client_ip),
         )
 
@@ -804,6 +1237,223 @@ class MagicAuthClient:
                 user_agent=user_agent,
                 client_ip=client_ip,
             ),
+        )
+
+    # Patreon entitlement link (current user's Bearer) ---------------------------
+    async def request_patreon_link(
+        self,
+        token: str,
+        *,
+        patreon_email_hint: str | None = None,
+        explicit_user_intent: bool = False,
+        confirm_email_match: bool = False,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> PatreonLinkRequestResponse:
+        """Begin the Patreon email-loop proof for the authenticated user (Bearer ``token``).
+
+        Patreon is an entitlement source, never a login provider. The provider answers
+        with the same generic accepted body whatever the outcome and never returns proof
+        or Patreon account material. ``patreon_email_hint`` is only a lookup hint;
+        ``explicit_user_intent`` must be true for the provider to act.
+        """
+        return await self._request(
+            "POST",
+            self._config.patreon_link_request_endpoint,
+            model=PatreonLinkRequestResponse,
+            json={
+                "patreon_email_hint": patreon_email_hint,
+                "explicit_user_intent": explicit_user_intent,
+                "confirm_email_match": confirm_email_match,
+            },
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def confirm_patreon_link(
+        self,
+        token: str,
+        *,
+        proof_token: str | None = None,
+        lookup_id: str | None = None,
+        secret: str | None = None,
+        explicit_user_intent: bool = False,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> PatreonLinkStatusResponse:
+        """Consume an emailed Patreon proof for the authenticated user (Bearer ``token``).
+
+        Pass the emailed ``proof_token`` (sent as the provider's ``token`` field), or its
+        ``lookup_id`` + ``secret`` parts. Not a login: it needs an existing session and
+        recent reauthentication. ``http_status`` is 200 when the link was applied and 202
+        for the provider's neutral posture (malformed, expired or replayed proof).
+        """
+        return await self._request(
+            "POST",
+            self._config.patreon_link_confirm_endpoint,
+            model=PatreonLinkStatusResponse,
+            json={
+                "token": proof_token,
+                "lookup_id": lookup_id,
+                "secret": secret,
+                "explicit_user_intent": explicit_user_intent,
+            },
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def get_patreon_link_status(
+        self,
+        token: str,
+        *,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> PatreonLinkStatusResponse:
+        """Read the authenticated user's safe Patreon link status (Bearer ``token``)."""
+        return await self._request(
+            "GET",
+            self._config.patreon_link_status_endpoint,
+            model=PatreonLinkStatusResponse,
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def unlink_patreon(
+        self,
+        token: str,
+        *,
+        explicit_user_intent: bool = False,
+        confirm_unlink: bool = False,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> PatreonUnlinkResponse:
+        """Soft-unlink the authenticated user's Patreon entitlement (Bearer ``token``).
+
+        Never revokes local sessions or API keys. Needs recent reauthentication. The
+        confirmation flags are sent only when set.
+        """
+        flags = {
+            "explicit_user_intent": explicit_user_intent,
+            "confirm_unlink": confirm_unlink,
+        }
+        return await self._request(
+            "DELETE",
+            self._config.patreon_link_endpoint,
+            model=PatreonUnlinkResponse,
+            json={name: True for name, is_set in flags.items() if is_set} or None,
+            headers=_request_headers(
+                bearer_token=token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    # Internal transactional email (root user's Bearer) --------------------------
+    async def resolve_email_identity(
+        self,
+        email: str,
+        *,
+        bearer_token: str,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> EmailIdentityResponse:
+        """Resolve whether ``email`` is an activated address of a provider account.
+
+        Internal surface: ``bearer_token`` must be a *root* user's access token.
+        """
+        return await self._request(
+            "POST",
+            self._config.internal_email_resolve_identity_endpoint,
+            model=EmailIdentityResponse,
+            json={"email": email},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def send_template_email(
+        self,
+        recipient_email: str,
+        template_code: str,
+        *,
+        bearer_token: str,
+        variables: Mapping[str, Any] | None = None,
+        provider_idempotency_key: str | None = None,
+        priority: int | None = None,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> TemplateEmailResponse:
+        """Queue a known transactional template to one recipient (root Bearer).
+
+        ``provider_idempotency_key`` (<= 128 chars) de-duplicates the enqueue;
+        ``priority`` is 0-9 (provider default 4). An unknown or disabled template
+        raises an :class:`AuthApiError`.
+        """
+        return await self._request(
+            "POST",
+            self._config.internal_email_send_template_endpoint,
+            model=TemplateEmailResponse,
+            json={
+                "recipient_email": recipient_email,
+                "template_code": template_code,
+                "variables": dict(variables) if variables is not None else None,
+                "provider_idempotency_key": provider_idempotency_key,
+                "priority": priority,
+            },
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    async def get_email_message_status(
+        self,
+        email_message_id: str,
+        *,
+        bearer_token: str,
+        user_agent: str | None = None,
+        client_ip: str | None = None,
+    ) -> EmailMessageStatusResponse:
+        """Read the redacted delivery state of one queued email (root Bearer).
+
+        An unknown id raises :class:`AuthNotFoundError`.
+        """
+        return await self._request(
+            "POST",
+            self._config.internal_email_message_status_endpoint,
+            model=EmailMessageStatusResponse,
+            json={"email_message_id": email_message_id},
+            headers=_request_headers(
+                bearer_token=bearer_token,
+                user_agent=user_agent,
+                client_ip=client_ip,
+            ),
+        )
+
+    # System ---------------------------------------------------------------------
+    async def ping(self, *, user_agent: str | None = None) -> PingResponse:
+        """Public liveness probe (``GET /system/ping``); needs no credential.
+
+        Raises like any other call when the provider is unreachable or unhealthy, so a
+        health check can treat any exception as "down".
+        """
+        return await self._request(
+            "GET",
+            self._config.ping_endpoint,
+            model=PingResponse,
+            headers=_request_headers(user_agent=user_agent),
         )
 
     # Delegated / service-to-service auth --------------------------------------

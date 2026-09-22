@@ -88,6 +88,11 @@ class MagicAuthConfig:
     google_oauth_callback_url: str | None = None
     project_hash: str | None = None
     user_group_hash: str | None = None
+    # Project-scoped API key for the provider-agnostic OAuth surface. It is sent as
+    # ``X-API-Key`` on ``/auth/oauth/init`` and ``/auth/oauth/providers`` only, is never
+    # logged by this library, and is excluded from ``repr()`` so it cannot leak through
+    # a traceback, a debugger frame or a structured log that renders the config.
+    project_api_key: str | None = field(default=None, repr=False)
     user_agent: str = constants.DEFAULT_USER_AGENT
     timeout_seconds: float = constants.DEFAULT_TIMEOUT_SECONDS
     verify_tls: bool = True
@@ -151,6 +156,23 @@ class MagicAuthConfig:
     def google_oauth_callback_endpoint(self) -> str:
         return self._resolve(self.google_oauth_callback_url, constants.PATH_GOOGLE_OAUTH_CALLBACK)
 
+    # Provider-agnostic OAuth (no env override; always resolved from base_url) -----
+    @property
+    def oauth_init_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_OAUTH_INIT)
+
+    @property
+    def oauth_start_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_OAUTH_START)
+
+    @property
+    def oauth_callback_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_OAUTH_CALLBACK)
+
+    @property
+    def oauth_providers_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_OAUTH_PROVIDERS)
+
     # Password & email endpoints (no env override; always resolved from base_url) --
     @property
     def password_forgot_endpoint(self) -> str:
@@ -187,6 +209,71 @@ class MagicAuthConfig:
         )
         return self._resolve(None, path)
 
+    # Internal S2S endpoints (no env override; always resolved from base_url) ------
+    def _user_scoped_endpoint(self, template: str, user_hash: str, **segments: str) -> str:
+        quoted = {name: quote(value, safe="") for name, value in segments.items()}
+        return self._resolve(
+            None, template.format(user_hash=quote(user_hash, safe=""), **quoted)
+        )
+
+    def billing_status_endpoint(self, user_hash: str) -> str:
+        return self._user_scoped_endpoint(constants.PATH_BILLING_STATUS, user_hash)
+
+    def billing_checkout_endpoint(self, user_hash: str) -> str:
+        return self._user_scoped_endpoint(constants.PATH_BILLING_CHECKOUT, user_hash)
+
+    def billing_portal_endpoint(self, user_hash: str) -> str:
+        return self._user_scoped_endpoint(constants.PATH_BILLING_PORTAL, user_hash)
+
+    def billing_purchase_endpoint(self, user_hash: str, purchase_ref: str) -> str:
+        return self._user_scoped_endpoint(
+            constants.PATH_BILLING_PURCHASE, user_hash, purchase_ref=purchase_ref
+        )
+
+    def billing_resync_endpoint(self, user_hash: str) -> str:
+        return self._user_scoped_endpoint(constants.PATH_BILLING_RESYNC, user_hash)
+
+    def patreon_entitlement_endpoint(self, user_hash: str) -> str:
+        return self._user_scoped_endpoint(constants.PATH_PATREON_ENTITLEMENT, user_hash)
+
+    def patreon_entitlement_resync_endpoint(self, user_hash: str) -> str:
+        return self._user_scoped_endpoint(
+            constants.PATH_PATREON_ENTITLEMENT_RESYNC, user_hash
+        )
+
+    @property
+    def internal_email_resolve_identity_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_INTERNAL_EMAIL_RESOLVE_IDENTITY)
+
+    @property
+    def internal_email_send_template_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_INTERNAL_EMAIL_SEND_TEMPLATE)
+
+    @property
+    def internal_email_message_status_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_INTERNAL_EMAIL_MESSAGE_STATUS)
+
+    # Patreon entitlement link (current user's Bearer) ---------------------------
+    @property
+    def patreon_link_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PATREON_LINK)
+
+    @property
+    def patreon_link_request_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PATREON_LINK_REQUEST)
+
+    @property
+    def patreon_link_confirm_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PATREON_LINK_CONFIRM)
+
+    @property
+    def patreon_link_status_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PATREON_LINK_STATUS)
+
+    @property
+    def ping_endpoint(self) -> str:
+        return self._resolve(None, constants.PATH_PING)
+
     # Construction -------------------------------------------------------------
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "MagicAuthConfig":
@@ -200,6 +287,8 @@ class MagicAuthConfig:
         * ``user_agent``: ``AUTH_FORWARD_USER_AGENT`` else ``AUTH_PROVIDER_USER_AGENT``
         * ``timeout_seconds``: ``AUTH_FORWARD_TIMEOUT_SECONDS`` else ``AUTH_API_TIMEOUT``
         * ``verify_tls``: ``AUTH_VERIFY_TLS`` (defaults to true)
+        * ``project_api_key``: ``AUTH_PROJECT_API_KEY`` (only needed for the
+          provider-agnostic ``/auth/oauth/init`` and ``/auth/oauth/providers`` calls)
         """
         e = env if env is not None else os.environ
         base_raw = e.get("AUTH_SERVICE_BASE_URL") or e.get("AUTH_API_URL") or constants.DEFAULT_BASE_URL
@@ -227,6 +316,7 @@ class MagicAuthConfig:
             google_oauth_callback_url=e.get("AUTH_GOOGLE_CALLBACK_URL"),
             project_hash=e.get("PROJECT_HASH"),
             user_group_hash=e.get("USER_GROUP_HASH"),
+            project_api_key=e.get("AUTH_PROJECT_API_KEY"),
             user_agent=user_agent,
             timeout_seconds=float(timeout_raw),
             verify_tls=_parse_bool(

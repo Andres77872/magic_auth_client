@@ -110,7 +110,6 @@ All methods are `async` and return a typed pydantic model.
 | `register(username, password, *, email=None, user_group_hash=None)` | `POST /auth/register` | `user_group_hash` required (or config default) |
 | `validate(*, token=None, session_token=None)` | `GET /auth/validate` | Bearer or `session_token` cookie; 200/`valid=False` not raised |
 | `validate_api_key(api_key)` | `POST /auth/validate-api-key` | `X-API-Key` only; never sends `Authorization` |
-| `get_billing_catalog(*, project_hash, bearer_token, provider="stripe")` | `GET /internal/projects/{hash}/billing/catalog` | dedicated billing S2S Bearer; consumer-safe catalog |
 | `logout(*, token=None, session_token=None)` | `POST /auth/logout` | |
 | `refresh(refresh_token, *, use_cookie=False)` | `POST /auth/refresh` | form/cookie, never Bearer |
 | `switch_project(access_token, project_hash, *, refresh_token=None)` | `POST /auth/switch-project` | Bearer header + form body |
@@ -125,9 +124,49 @@ All methods are `async` and return a typed pydantic model.
 | `resend_email_activation(token, email_id, *, idempotency_key=None)` | `POST /users/me/emails/{id}/resend` | Bearer; optional `Idempotency-Key`; cooldown-limited |
 | `remove_email(token, email_id)` | `DELETE /users/me/emails/{id}` | Bearer; promotes next primary |
 | `set_primary_email(token, email_id)` | `POST /users/me/emails/{id}/primary` | Bearer; address must be activated |
-| `start_google_oauth(provider_init_token, *, redirect_uri, return_origin, remember_me=False)` | `POST /auth/google/start` | returns Google's authorization URL (the 303 `Location`; not followed) |
-| `complete_google_oauth(code, state)` | `GET /auth/google/callback` | server-to-server; returns a `LoginResponse` |
+| `oauth_init(connection, *, return_origin, remember_me=False, purpose="login")` | `POST /auth/oauth/init` | project-scoped `X-API-Key`; returns an `OAuthInitResponse` carrying a single-use `init_token` |
+| `oauth_start(init_token, redirect_uri, *, remember_me=None)` | `POST /auth/oauth/start` | returns the provider's authorization URL (the 303 `Location`; not followed); `remember_me` is sent only when not `None` |
+| `oauth_callback(code, state, *, iss=None, error=None)` | `GET /auth/oauth/callback` | server-to-server; returns a `LoginResponse` |
+| `list_oauth_providers()` | `GET /auth/oauth/providers` | project-scoped `X-API-Key`; enabled connections for the login page |
+| `start_google_oauth(provider_init_token, *, redirect_uri, return_origin, remember_me=False)` | `POST /auth/google/start` | **deprecated alias**; returns Google's authorization URL (the 303 `Location`; not followed) |
+| `complete_google_oauth(code, state)` | `GET /auth/google/callback` | **deprecated alias**; server-to-server; returns a `LoginResponse` |
 | `validate_delegated_session(*, delegation_api_key, session_token, …)` | `validate-api-key` + `validate` | see [Delegated auth](#delegated-auth) |
+
+### Server-to-server, entitlement and system surfaces
+
+These use a credential other than the end user's session (noted per row), send JSON
+bodies, and return models that expose `http_status` — the provider answers some of
+them with different 2xx codes that carry meaning (e.g. checkout: `202` created vs
+`200` idempotent replay; Patreon confirm: `200` linked vs `202` neutral posture).
+`http_status` is a private attribute: it never appears in `model_dump()`.
+
+| Method | Endpoint | Notes |
+|---|---|---|
+| `get_billing_catalog(*, project_hash, bearer_token, provider="stripe", item_type=None)` | `GET /internal/projects/{hash}/billing/catalog` | billing S2S Bearer; consumer-safe catalog; `item_type` filters to `subscription_plan` / `credit_package` |
+| `get_billing_status(user_hash, *, project_hash, bearer_token, provider="stripe")` | `GET /internal/users/{hash}/billing` | billing S2S Bearer; subscription facts + purchases; no history → `status="free"` |
+| `get_billing_purchase(user_hash, purchase_ref, *, project_hash, bearer_token, provider="stripe")` | `GET /internal/users/{hash}/billing/purchases/{ref}` | billing S2S Bearer; unknown ref → `AuthNotFoundError` |
+| `create_billing_checkout(user_hash, *, bearer_token, project_hash, intent_type, price_ref, success_url, cancel_url, …, idempotency_key=None)` | `POST /internal/users/{hash}/billing/checkout` | billing S2S Bearer; `intent_type` `subscription` / `credit_purchase`; `price_ref={"ref_type": "lookup_key", "value": …}`; key reuse with another body → `AuthConflictError` |
+| `create_billing_portal(user_hash, *, bearer_token, project_hash, return_url, provider="stripe", idempotency_key=None)` | `POST /internal/users/{hash}/billing/portal` | billing S2S Bearer; hosted, restricted portal session |
+| `request_billing_resync(user_hash, *, bearer_token, project_hash, reason=None)` | `POST /internal/users/{hash}/billing/resync` | billing S2S Bearer; always 202 — read `accepted` / `status` |
+| `get_patreon_entitlement(user_hash, *, bearer_token)` | `GET /internal/users/{hash}/entitlements` | Patreon S2S Bearer; user-scoped (no project); no link → `status="free"` |
+| `request_patreon_resync(user_hash, *, bearer_token, force=False, reason=None)` | `POST /internal/users/{hash}/entitlements/patreon/resync` | Patreon S2S Bearer; always 202 — read `accepted` / `status` |
+| `request_patreon_link(token, *, patreon_email_hint=None, explicit_user_intent=False, confirm_email_match=False)` | `POST /auth/patreon/link/request` | user Bearer; generic accepted body, never returns proof material |
+| `confirm_patreon_link(token, *, proof_token=None, lookup_id=None, secret=None, explicit_user_intent=False)` | `POST /auth/patreon/link/confirm` | user Bearer; `proof_token` is sent as the provider's `token` field; needs recent reauth |
+| `get_patreon_link_status(token)` | `GET /auth/patreon/link/status` | user Bearer |
+| `unlink_patreon(token, *, explicit_user_intent=False, confirm_unlink=False)` | `DELETE /auth/patreon/link` | user Bearer; never revokes sessions; needs recent reauth |
+| `resolve_email_identity(email, *, bearer_token)` | `POST /internal/email/resolve-identity` | **root** user's Bearer; is this an activated address of an account? |
+| `send_template_email(recipient_email, template_code, *, bearer_token, variables=None, provider_idempotency_key=None, priority=None)` | `POST /internal/email/send-template` | **root** user's Bearer; queues a known transactional template |
+| `get_email_message_status(email_message_id, *, bearer_token)` | `POST /internal/email/message-status` | **root** user's Bearer; redacted delivery state; unknown id → `AuthNotFoundError` |
+| `ping()` | `GET /system/ping` | no credential; raises like any call when the provider is down, so a health check can treat any exception as unhealthy |
+
+Patreon is an **entitlement source, never a login provider**: the link routes act on
+the already-authenticated user and mint no session. The internal email bodies carry no
+`success`/`message` envelope, so those models do not extend `ActionResponse`.
+
+A BFF that mirrors a provider reply to its own caller can reproduce it exactly with
+`(resp.http_status, resp.model_dump(mode="json", exclude_unset=True))` — `exclude_unset`
+keeps the explicit nulls the provider sent and invents no defaults — and on failure
+with `(exc.status_code, exc.raw)`.
 
 **Email login** needs no new method: `login()` already forwards the `username` field
 verbatim, and the provider accepts an **activated email** there. Password login and
@@ -138,13 +177,19 @@ Action-only password/email methods return the public `ActionResponse` model. For
 enqueue operations, reuse a stable `idempotency_key` when retrying the same logical
 request; the client forwards it as `Idempotency-Key`.
 
-Consumer-facing auth methods also accept an optional `client_ip`. It is forwarded as
+Every method that reaches the provider on behalf of a user also accepts an optional `client_ip`. It is forwarded as
 `X-Forwarded-For` so a trusted BFF can preserve end-user rate-limit attribution. Only
 pass an address derived from the server-observed peer after applying the deployment's
 trusted-proxy policy; never copy a browser-supplied forwarding header into this field.
 They also accept a per-call `user_agent` override where request attribution is useful.
 
-**Google sign-in** exposes only the two *agnostic* legs (`start_google_oauth` / `complete_google_oauth`). The project-specific concerns — minting the opaque `provider_init_token`, the browser entry/return, the one-time delivery code, and the session cookie — belong to the consuming BFF, not this client. `start_google_oauth` does **not** follow the `303`; it returns Google's authorization URL for the BFF to hand to the browser. `complete_google_oauth` is a server-to-server call (no browser cookies) and returns the same `LoginResponse` as password login, including the refresh token.
+**OAuth sign-in** exposes only the *agnostic* legs. The project-specific concerns — the browser entry/return, the one-time delivery code, and the session cookie — belong to the consuming BFF, not this client. Neither start method follows the `303`; both return the provider's authorization URL for the BFF to hand to the browser as a top-level navigation. Both callback methods are server-to-server calls (no browser cookies) and return the same `LoginResponse` as password login, including the refresh token.
+
+`oauth_init` / `oauth_start` / `oauth_callback` / `list_oauth_providers` are connection-parameterised and use the **inverted handshake**: the BFF authenticates to `/auth/oauth/init` with a project-scoped API key (`project_api_key` on the config, or `AUTH_PROJECT_API_KEY` via `from_env`; sent as `X-API-Key`, never logged, excluded from the config's `repr`). The provider derives the project from that credential and the provisioning group from the binding, so the body must not carry `project_hash` or `user_group_hash` — and the provider never calls back into the consumer. After `oauth_init`, `oauth_start` takes the `init_token`, the `redirect_uri` and optionally `remember_me`; everything that is *scope* — project, connection, return origin, provisioning group — was fixed at init time and cannot be influenced here. `remember_me` is the exception: it is a user preference, so the provider lets a start request override the value bound at init. It is sent only when it is not `None`, and only a real JSON boolean overrides — pass `None` (the default) to leave the init-time value alone, which is not the same as passing `False`.
+
+`start_google_oauth` / `complete_google_oauth` are the **deprecated** Google-named wrappers for the legacy handshake, where the consumer mints the opaque `provider_init_token` itself and the provider redeems it at the consumer's internal endpoint. They are unchanged and keep working; new code should use the connection-parameterised methods.
+
+Two callback error codes deserve their own message in a UI rather than a generic failure: `EXT_8031` (`OAUTH_USER_CANCELLED` — the user cancelled at the provider, HTTP 400) and `EXT_8032` (`OAUTH_ACCOUNT_LINK_REQUIRED` — an existing local account owns this e-mail, so the user must sign in and link, HTTP 409). Branch on `AuthApiError.error_name`, never on the provider's name.
 
 ## Delegated auth
 

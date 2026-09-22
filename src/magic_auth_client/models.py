@@ -10,11 +10,28 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 
 class _AuthModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
+
+
+class _HttpStatusMixin(_AuthModel):
+    """Adds :attr:`http_status` to responses whose HTTP status carries meaning.
+
+    Some provider endpoints answer the same request with different 2xx codes (e.g.
+    checkout: ``202`` for a new session, ``200`` for an idempotent replay; Patreon link
+    confirm: ``200`` linked vs ``202`` neutral). The client sets the status after
+    parsing so a BFF can mirror it to its own caller. It is a private attribute: it is
+    never part of ``model_dump()`` and is ``None`` on hand-built instances.
+    """
+
+    _http_status: int | None = PrivateAttr(default=None)
+
+    @property
+    def http_status(self) -> int | None:
+        return self._http_status
 
 
 # Shared components ------------------------------------------------------------
@@ -178,6 +195,245 @@ class BillingCatalogResponse(ActionResponse):
     provider: str | None = None
     subscriptions: list[BillingCatalogItem] = Field(default_factory=list)
     credit_packs: list[BillingCatalogItem] = Field(default_factory=list)
+
+
+# Internal billing (S2S) ---------------------------------------------------------
+class BillingStatus(_AuthModel):
+    """Safe subscription facts for one user/project (``api.auth`` ``BillingSafeStatus``).
+
+    ``status`` is one of free|pending|incomplete|trialing|active|past_due|unpaid|paused|
+    canceled|former|stale|unknown; ``link_status`` is none|pending|linked|revoked|stale.
+    ``customer_ref``/``subscription_ref`` are opaque provider-side references, never raw
+    Stripe ids.
+    """
+
+    provider: str | None = None
+    status: str = "free"
+    plan_code: str = "free"
+    tier_code: str | None = None
+    tier_name: str | None = None
+    link_status: str = "none"
+    current_period_end: datetime | None = None
+    cancel_at_period_end: bool = False
+    trial_end: datetime | None = None
+    grace_period_until: datetime | None = None
+    last_synced_at: datetime | None = None
+    stale_after: datetime | None = None
+    classification_version: int | None = None
+    customer_ref: str | None = None
+    subscription_ref: str | None = None
+
+
+class BillingPurchase(_AuthModel):
+    """Safe one-time purchase facts (``api.auth`` ``BillingSafePurchaseStatus``).
+
+    ``status`` is one of pending|paid|refunded|partially_refunded|disputed|dispute_won|
+    dispute_lost|stale|unknown.
+    """
+
+    provider: str | None = None
+    purchase_ref: str | None = None
+    status: str = "pending"
+    credit_product_code: str | None = None
+    quantity: int | None = None
+    paid_at: datetime | None = None
+    refunded_at: datetime | None = None
+    disputed_at: datetime | None = None
+    last_synced_at: datetime | None = None
+    stale_after: datetime | None = None
+    classification_version: int | None = None
+
+
+class BillingStatusResponse(ActionResponse, _HttpStatusMixin):
+    contract_version: int = 2
+    user_hash: str | None = None
+    project_hash: str | None = None
+    provider: str | None = None
+    billing: BillingStatus | None = None
+    purchases: list[BillingPurchase] = Field(default_factory=list)
+
+
+class BillingPurchaseResponse(ActionResponse, _HttpStatusMixin):
+    contract_version: int = 2
+    user_hash: str | None = None
+    project_hash: str | None = None
+    provider: str | None = None
+    purchase: BillingPurchase | None = None
+
+
+class BillingCheckoutResponse(ActionResponse, _HttpStatusMixin):
+    """Hosted Checkout session. ``http_status`` is 202 when created, 200 on a replay."""
+
+    contract_version: int = 2
+    checkout_ref: str | None = None
+    purchase_ref: str | None = None
+    subscription_ref: str | None = None
+    url: str | None = None
+
+
+class BillingPortalResponse(ActionResponse, _HttpStatusMixin):
+    """Hosted, restricted Portal session. ``http_status`` is 202 new, 200 on a replay."""
+
+    contract_version: int = 2
+    portal_ref: str | None = None
+    url: str | None = None
+
+
+class BillingResyncResponse(ActionResponse, _HttpStatusMixin):
+    """Resync acknowledgement. ``status`` is accepted|queued|disabled|rate_limited|
+    degraded; ``accepted`` is false when the provider declined to queue the work."""
+
+    contract_version: int = 2
+    accepted: bool = True
+    status: str = "accepted"
+    user_hash: str | None = None
+    project_hash: str | None = None
+    provider: str | None = None
+    retry_after_seconds: int | None = None
+    not_before: datetime | None = None
+    correlation_id: str | None = None
+
+
+# Patreon entitlements -----------------------------------------------------------
+class PatreonEntitlement(_AuthModel):
+    """Safe Patreon entitlement facts (``api.auth`` ``PatreonSafeEntitlement``).
+
+    ``status`` is active|free|pending|former|revoked|stale; ``link_status`` is
+    none|pending|linked|unlinked|revoked|blocked. Never carries Patreon ids or emails.
+    """
+
+    external_source: str | None = None
+    status: str = "free"
+    plan_code: str = "free"
+    tier_code: str | None = None
+    tier_name: str | None = None
+    link_status: str = "none"
+    next_renewal_at: datetime | None = None
+    grace_period_until: datetime | None = None
+    last_synced_at: datetime | None = None
+    stale_after: datetime | None = None
+    classification_version: int | None = None
+
+
+class PatreonEntitlementResponse(ActionResponse, _HttpStatusMixin):
+    user_hash: str | None = None
+    entitlement: PatreonEntitlement | None = None
+    contract_version: int = 1
+
+
+class PatreonResyncResponse(ActionResponse, _HttpStatusMixin):
+    """Resync acknowledgement; same ``status``/``accepted`` semantics as billing."""
+
+    accepted: bool = True
+    status: str = "accepted"
+    user_hash: str | None = None
+    retry_after_seconds: int | None = None
+    not_before: datetime | None = None
+    correlation_id: str | None = None
+    contract_version: int = 1
+
+
+class PatreonLinkRequestResponse(ActionResponse, _HttpStatusMixin):
+    """Generic accepted body for a link request (never discloses proof material)."""
+
+    accepted: bool = True
+    link_status: str | None = None
+    retry_after_seconds: int | None = None
+
+
+class PatreonLinkStatusResponse(ActionResponse, _HttpStatusMixin):
+    """Link status for the current user. On confirm, ``http_status`` is 200 when the
+    link was applied and 202 for the provider's neutral (no-disclosure) posture."""
+
+    link_status: str = "none"
+    entitlement: PatreonEntitlement | None = None
+    retry_after_seconds: int | None = None
+
+
+class PatreonUnlinkResponse(ActionResponse, _HttpStatusMixin):
+    link_status: str = "unlinked"
+    entitlement: PatreonEntitlement | None = None
+
+
+# Internal transactional email (root Bearer) -------------------------------------
+# These provider bodies carry no ``success``/``message`` envelope, so the models
+# deliberately do not extend ``ActionResponse``.
+class EmailIdentityResponse(_AuthModel):
+    """Whether an address is an *activated* email of a provider account.
+
+    ``user_hash``/``username``/``user_type`` are only present when ``matched``.
+    """
+
+    matched: bool = False
+    email: str | None = None
+    email_masked: str | None = None
+    user_hash: str | None = None
+    username: str | None = None
+    user_type: str | None = None
+
+
+class TemplateEmailResponse(_AuthModel):
+    """Enqueue result for a transactional template email (provider replies 202)."""
+
+    accepted: bool = False
+    email_message_id: str | None = None
+    lifecycle_status: str | None = None
+    template_code: str | None = None
+
+
+class EmailMessageStatusResponse(_AuthModel):
+    """Redacted delivery state of one queued transactional email."""
+
+    email_message_id: str | None = None
+    purpose: str | None = None
+    template_code: str | None = None
+    recipient_masked: str | None = None
+    provider: str | None = None
+    provider_message_id: str | None = None
+    status: str | None = None
+    attempt_count: int | None = None
+    max_attempts: int | None = None
+    sent_at: datetime | None = None
+    terminal_at: datetime | None = None
+    last_error_code: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+# Provider-agnostic OAuth ---------------------------------------------------------
+class OAuthInitResponse(ActionResponse):
+    """Single-use init token minted by ``POST /auth/oauth/init``.
+
+    ``connection`` and ``provider_type`` are echoed from the binding the provider
+    resolved for the calling project's credential, so a BFF can log or render which
+    provider it is about to start without keeping its own copy of that mapping.
+    """
+
+    init_token: str | None = None
+    expires_in: int | None = None
+    connection: str | None = None
+    provider_type: str | None = None
+
+
+class OAuthProvider(_AuthModel):
+    """One enabled sign-in provider, as rendered on a login page."""
+
+    connection: str | None = None
+    provider_type: str | None = None
+    display_name: str | None = None
+
+
+class OAuthProvidersResponse(ActionResponse):
+    """Enabled sign-in providers for the calling project (``GET /auth/oauth/providers``)."""
+
+    providers: list[OAuthProvider] = Field(default_factory=list)
+
+
+# System -------------------------------------------------------------------------
+class PingResponse(ActionResponse):
+    """Public liveness probe. ``timestamp`` is the provider's UTC ISO-8601 clock."""
+
+    timestamp: str | None = None
 
 
 class LogoutResponse(ActionResponse):
